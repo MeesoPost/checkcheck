@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# Backtraces die panics achterlaten
+rustc-ice-*.txt
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
