@@ -1,5 +1,3 @@
-//! Read-only access to the local Docker daemon through `/var/run/docker.sock`.
-
 use anyhow::{bail, Context, Result};
 use bollard::container::ListContainersOptions;
 use bollard::image::CreateImageOptions;
@@ -11,26 +9,16 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct RunningContainer {
     pub name: String,
-    /// Image reference as used when the container was created.
     pub image: String,
-    /// Local image ID (`sha256:...`).
     pub image_id: String,
     pub repo_digests: Vec<String>,
-    /// Platform the local image was built for — needed to pick the right
-    /// entry out of a multi-arch manifest list when asking the registry for
-    /// that same platform's build date.
     pub os: String,
     pub architecture: String,
-    /// When the locally cached image was built upstream (RFC 3339), if the
-    /// image config records it.
     pub created: Option<String>,
-    /// Compose project the container belongs to, i.e. its Portainer stack.
-    /// `None` for containers created outside a stack.
     pub project: Option<String>,
 }
 
 impl RunningContainer {
-    /// Group key: same reference *and* same local image counts as one check.
     pub fn key(&self) -> String {
         format!("{}\u{1f}{}", self.image, self.image_id)
     }
@@ -44,11 +32,6 @@ struct ImageMeta {
     created: Option<String>,
 }
 
-/// Open a daemon connection, trying the places a socket actually lives rather
-/// than only `/var/run/docker.sock`: `$DOCKER_HOST` wins, and Docker Desktop on
-/// macOS puts its socket under `~/.docker` and no longer always symlinks the
-/// system path. Every candidate is pinged, because a socket that exists but
-/// answers nothing is not a working connection.
 pub async fn connect() -> Result<Docker> {
     let mut failures = Vec::new();
 
@@ -81,9 +64,6 @@ pub async fn connect() -> Result<Docker> {
     )
 }
 
-/// Socket paths worth trying, most specific first. Docker Desktop's own socket
-/// comes before the system path: when both exist the system one may be a stale
-/// symlink left by an earlier install.
 fn socket_candidates() -> Vec<String> {
     let mut paths = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
@@ -162,11 +142,6 @@ fn compose_project(summary: &ContainerSummary) -> Option<String> {
         .cloned()
 }
 
-/// `summary.image` (from the container list) falls back to a bare image ID
-/// once the tag it was created from has been reassigned to a different local
-/// image — e.g. a `docker pull` of the same tag without recreating the
-/// container. `Config.Image` from a per-container inspect keeps the original
-/// reference regardless, so prefer that whenever it's available.
 async fn image_reference(docker: &Docker, summary: &ContainerSummary) -> String {
     let from_inspect = match &summary.id {
         Some(id) => docker
@@ -181,7 +156,6 @@ async fn image_reference(docker: &Docker, summary: &ContainerSummary) -> String 
     from_inspect.unwrap_or_else(|| summary.image.clone().unwrap_or_default())
 }
 
-/// A failing inspect is not fatal: the image is then reported as "no digest".
 async fn image_meta(docker: &Docker, image_id: &str) -> ImageMeta {
     let Some(info) = docker.inspect_image(image_id).await.ok() else {
         return ImageMeta::default();
@@ -194,10 +168,6 @@ async fn image_meta(docker: &Docker, image_id: &str) -> ImageMeta {
     }
 }
 
-/// `docker pull {repository}:{tag}`, nothing more: the new image lands in the
-/// local store and every running container keeps running the image it started
-/// with. Recreating a container to actually adopt the pull stays a deliberate,
-/// separate step.
 pub async fn pull_image(docker: &Docker, repository: &str, tag: &str) -> Result<()> {
     let options = CreateImageOptions {
         from_image: repository,
@@ -207,8 +177,6 @@ pub async fn pull_image(docker: &Docker, repository: &str, tag: &str) -> Result<
 
     let mut stream = docker.create_image(Some(options), None, None);
     while let Some(item) = stream.next().await {
-        // The daemon reports a failed layer in-band as well as through the
-        // transport, so both have to be checked.
         let info = item.with_context(|| format!("pulling {repository}:{tag} failed"))?;
         if let Some(error) = info.error {
             bail!("pulling {repository}:{tag} failed: {}", error.trim());

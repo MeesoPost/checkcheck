@@ -1,9 +1,3 @@
-//! Minimal Docker Registry v2 client.
-//!
-//! We only ever ask the registry for the *digest* of a tag (a HEAD on the
-//! manifest endpoint). No layers are downloaded, nothing is pulled, and no
-//! credentials are used — anonymous token auth only.
-
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::header::{ACCEPT, WWW_AUTHENTICATE};
 use reqwest::{Client, Method, Response, StatusCode};
@@ -12,9 +6,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Accept both the Docker and the OCI flavours, and both single manifests and
-/// multi-arch indexes. Getting this wrong makes the registry return the digest
-/// of a *platform-specific* manifest, which never matches the local RepoDigest.
 const MANIFEST_ACCEPT: &str = "application/vnd.docker.distribution.manifest.list.v2+json, \
      application/vnd.docker.distribution.manifest.v2+json, \
      application/vnd.oci.image.index.v1+json, \
@@ -24,18 +15,13 @@ const DIGEST_HEADER: &str = "docker-content-digest";
 
 #[derive(Debug, Clone)]
 pub struct ImageRef {
-    /// Registry API host, e.g. `registry-1.docker.io` or `lscr.io`.
     pub host: String,
-    /// Repository path, e.g. `library/nginx` or `linuxserver/sonarr`.
     pub repository: String,
     pub tag: String,
-    /// Set when the container runs an image pinned by digest (`image@sha256:...`).
     pub pinned_digest: Option<String>,
-    /// Reference without tag/digest, used to match against RepoDigests.
     pub name_no_tag: String,
 }
 
-/// Parse a Docker image reference into its registry components.
 pub fn parse(image: &str) -> Result<ImageRef> {
     let image = image.trim();
     if image.is_empty() {
@@ -47,8 +33,6 @@ pub fn parse(image: &str) -> Result<ImageRef> {
         None => (image, None),
     };
 
-    // A colon separates the tag only when no slash follows it, otherwise it is
-    // a registry port (`registry.local:5000/foo`).
     let tag_sep = name_part
         .rfind(':')
         .filter(|i| !name_part[*i..].contains('/'));
@@ -82,11 +66,6 @@ pub fn parse(image: &str) -> Result<ImageRef> {
 }
 
 impl ImageRef {
-    /// Find the registry digest that the local image was pulled with.
-    ///
-    /// `docker inspect` reports these as `RepoDigests: ["nginx@sha256:..."]`.
-    /// For a multi-arch image this is the digest of the manifest *list*, which
-    /// is exactly what the registry returns for the tag.
     pub fn local_digest(&self, repo_digests: &[String]) -> Option<String> {
         if let Some(pinned) = &self.pinned_digest {
             return Some(pinned.clone());
@@ -101,8 +80,6 @@ impl ImageRef {
             return Some(digest.to_string());
         }
 
-        // Single entry that we could not match by name: still the right one in
-        // practice (renamed/retagged images).
         match repo_digests {
             [only] => only.split_once('@').map(|(_, d)| d.to_string()),
             _ => None,
@@ -120,7 +97,6 @@ fn normalize_name(name: &str) -> &str {
 
 pub struct RegistryClient {
     http: Client,
-    /// Anonymous pull tokens, keyed by `host/repository`.
     tokens: HashMap<String, String>,
 }
 
@@ -137,7 +113,6 @@ impl RegistryClient {
         })
     }
 
-    /// Return the digest the registry currently serves for this tag.
     pub async fn manifest_digest(&mut self, image: &ImageRef) -> Result<String> {
         let url = format!(
             "https://{}/v2/{}/manifests/{}",
@@ -165,7 +140,6 @@ impl RegistryClient {
             bail!("registry returned HTTP {status}");
         }
 
-        // Registry does not support HEAD, or omitted the digest header.
         self.digest_via_get(&url, image).await
     }
 
@@ -179,7 +153,6 @@ impl RegistryClient {
             return Ok(digest);
         }
 
-        // Last resort: the digest is the sha256 of the manifest bytes.
         let body = resp
             .bytes()
             .await
@@ -187,11 +160,6 @@ impl RegistryClient {
         Ok(format!("sha256:{:x}", Sha256::digest(&body)))
     }
 
-    /// Best-effort: the upstream build timestamp (`created`, RFC 3339) baked
-    /// into the image config for `digest`. If `digest` names a multi-arch
-    /// manifest list, resolves to the entry matching `os`/`architecture`
-    /// first. Returns `None` on any failure — this is supplementary
-    /// information for the report, never worth failing the run over.
     pub async fn manifest_created(
         &mut self,
         image: &ImageRef,
@@ -229,7 +197,6 @@ impl RegistryClient {
         config.get("created")?.as_str().map(str::to_string)
     }
 
-    /// GET `{kind}/{reference}` (`manifests` or `blobs`) as JSON.
     async fn get_json(
         &mut self,
         image: &ImageRef,
@@ -250,8 +217,6 @@ impl RegistryClient {
             .context("could not parse the registry response as JSON")
     }
 
-    /// Send a request with the cached anonymous token, and on a 401 answer the
-    /// bearer challenge once and retry.
     async fn send(
         &mut self,
         method: Method,
@@ -342,7 +307,6 @@ fn digest_header(resp: &Response) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."` header.
 fn parse_challenge(header: &str) -> HashMap<String, String> {
     let header = header.trim();
     let rest = match header.get(..6) {

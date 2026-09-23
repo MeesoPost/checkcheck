@@ -1,17 +1,3 @@
-//! checkcheck — report which running Docker containers have a real image
-//! update available. It never recreates and never restarts a container; with
-//! `--pull` it does fetch confirmed updates into the local image store, so
-//! adopting one stays a deliberate, separate step.
-//!
-//! How it decides:
-//!   local  = the RepoDigest of the image the container currently runs
-//!   remote = the digest the registry currently serves for that tag
-//! Every result needs a second, independent read a few seconds later that
-//! agrees with the first before it's trusted — whether the two digests
-//! matched or differed. Multi-arch `:latest` tags on Docker Hub / lscr.io
-//! can serve a stale digest from a CDN edge for longer than the delay, in
-//! either direction: a false "up to date" as easily as a false positive.
-
 mod docker;
 mod portainer;
 mod registry;
@@ -79,17 +65,9 @@ struct Cli {
 enum Status {
     Pending,
     UpToDate,
-    UpdateAvailable {
-        remote: String,
-    },
-    /// The two passes disagreed — treated as noise, not as an update.
-    Unstable {
-        first: String,
-        second: String,
-    },
-    /// Container runs an image pinned by digest.
+    UpdateAvailable { remote: String },
+    Unstable { first: String, second: String },
     Pinned,
-    /// No registry digest locally (built or imported image).
     NoDigest,
     Error(String),
 }
@@ -104,21 +82,11 @@ struct Check {
     parsed: Option<ImageRef>,
     local_digest: Option<String>,
     status: Status,
-    /// Pass-1 reading. Held aside rather than folded into `status`: on its own
-    /// it proves nothing, matching or not, until pass 2 agrees with it.
     first_remote: Option<String>,
-    /// Platform of the locally running image — needed to resolve the right
-    /// entry in a multi-arch manifest list when asking the registry for its
-    /// build date.
     os: String,
     architecture: String,
-    /// When the image currently running was built upstream (RFC 3339).
     local_created: Option<String>,
-    /// When the update (if any) was built upstream (RFC 3339). This — not a
-    /// locally-tracked "first seen" — answers "since when has this been out of
-    /// date" without keeping state between runs.
     remote_created: Option<String>,
-    /// Result of `--pull`, `None` when no pull was attempted.
     pulled: Option<Pull>,
 }
 
@@ -172,9 +140,6 @@ async fn run() -> Result<()> {
         && std::env::var_os("NO_COLOR").is_none()
         && std::io::stdout().is_terminal();
 
-    // Fail on a missing token or URL now rather than after the checks: a
-    // misconfigured cron job should complain on its first run, not weeks later
-    // when an update finally appears.
     let portainer = cli
         .redeploy
         .then(|| {
@@ -201,7 +166,6 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // One check per unique (image reference, local image id) pair.
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut checks: Vec<Check> = Vec::new();
 
@@ -290,8 +254,6 @@ async fn run() -> Result<()> {
         };
     }
 
-    // For confirmed updates, look up when that build was published upstream.
-    // Best-effort: a miss here just means the date lines are omitted.
     for check in checks.iter_mut() {
         let (Status::UpdateAvailable { remote }, Some(parsed)) = (&check.status, &check.parsed)
         else {
@@ -326,9 +288,6 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Pull every confirmed update. One pull per image reference even when several
-/// containers share it, and a failure is recorded against the check rather than
-/// aborting the run — the remaining images are still worth fetching.
 async fn pull_updates(docker: &bollard::Docker, checks: &mut [Check], json: bool) {
     let targets: Vec<(usize, String, String)> = checks
         .iter()
@@ -357,15 +316,11 @@ async fn pull_updates(docker: &bollard::Docker, checks: &mut [Check], json: bool
     }
 }
 
-/// One stack that needs redeploying, with the containers that motivated it.
 struct Target {
     stack: Stack,
     containers: Vec<String>,
 }
 
-/// Redeploy the Portainer stack behind every confirmed update. Portainer pulls
-/// the images itself as part of the deploy, so `--pull` is not a prerequisite —
-/// running both only moves the download ahead of the downtime window.
 async fn redeploy_stacks(
     client: &PortainerClient,
     containers: &[RunningContainer],
@@ -433,8 +388,6 @@ async fn redeploy_stacks(
         print!("redeploying {name}… ");
         std::io::stdout().flush().ok();
 
-        // Send the stack's own file back untouched: the compose file pins no
-        // digests, so pulling is what moves it to the new image.
         let result = match client.stack_file(target.stack.id).await {
             Ok(compose) => client.redeploy(&target.stack, &compose).await,
             Err(err) => Err(err),
@@ -447,9 +400,6 @@ async fn redeploy_stacks(
     Ok(())
 }
 
-/// Group outdated containers by the stack that owns them, and report the ones
-/// no stack claims. Portainer names a stack's compose project after the stack
-/// itself, but compose lowercases project names, so the match ignores case.
 fn plan_redeploy(outdated: &[&RunningContainer], stacks: &[Stack]) -> (Vec<Target>, Vec<String>) {
     let mut targets: Vec<Target> = Vec::new();
     let mut unmanaged: Vec<String> = Vec::new();
@@ -474,9 +424,6 @@ fn plan_redeploy(outdated: &[&RunningContainer], stacks: &[Stack]) -> (Vec<Targe
     (targets, unmanaged)
 }
 
-/// Ask on the terminal. Anything other than an interactive answer of `y` is a
-/// no, so an unattended run (cron, a pipe) declines instead of restarting
-/// services with nobody watching.
 fn confirm(prompt: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         println!("Not running on a terminal — refusing to redeploy without confirmation.");
@@ -512,9 +459,6 @@ fn print_report(
     }
 }
 
-/// What to print after the container name — `None` for the boring cases
-/// (up to date, not checked) so those stay a single bare line; only the
-/// statuses worth acting on get anything extra, and never a raw digest.
 fn detail_suffix(container: &RunningContainer, check: &Check) -> Option<String> {
     match &check.status {
         Status::UpdateAvailable { .. } => {
@@ -539,12 +483,10 @@ fn detail_suffix(container: &RunningContainer, check: &Check) -> Option<String> 
     }
 }
 
-/// `YYYY-MM-DD` prefix of an RFC 3339 timestamp.
 fn short_date(rfc3339: &str) -> &str {
     rfc3339.get(0..10).unwrap_or(rfc3339)
 }
 
-/// ` (today)`, ` (3 days ago)`, or empty when the date cannot be read.
 fn age(rfc3339: &str) -> String {
     match days_ago(rfc3339) {
         Some(0) => " (today)".to_string(),
@@ -554,8 +496,6 @@ fn age(rfc3339: &str) -> String {
     }
 }
 
-/// Whole days between an RFC 3339 timestamp's date and today (UTC). Howard
-/// Hinnant's `days_from_civil`, so one field needs no date crate.
 fn days_ago(rfc3339: &str) -> Option<i64> {
     let mut parts = rfc3339.get(0..10)?.split('-');
     let y: i64 = parts.next()?.parse().ok()?;
@@ -580,9 +520,6 @@ fn unix_now() -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// Every status already has a distinct icon and text label, so colour is never
-/// the only signal. `dim` (ANSI `2`) is deliberately avoided: terminals render
-/// it as a faint grey that regularly fails to stay legible on light themes.
 fn icon_for(status: &Status) -> (&'static str, &'static str) {
     match status {
         Status::UpToDate => ("✅", "1;32"),
@@ -701,8 +638,6 @@ mod tests {
         assert_eq!(targets[1].containers, vec!["gitea"]);
     }
 
-    /// Compose lowercases project names, so a stack named `Media` in Portainer
-    /// still has to match a `media` label.
     #[test]
     fn matches_a_stack_name_case_insensitively() {
         let stacks = vec![stack(7, "Media", false)];
@@ -751,9 +686,6 @@ mod tests {
         }
     }
 
-    /// Renders one of every status so the layout can be eyeballed with
-    /// `cargo test -- --nocapture`, and so a missing index would panic here
-    /// instead of in production.
     #[test]
     fn renders_every_status() {
         let containers = vec![
@@ -783,8 +715,6 @@ mod tests {
             Status::Pinned,
         ];
 
-        // Only the second container carries an update, so only it can show a
-        // pull outcome; the rest exercise the `None` path.
         let mut pulls = [None, Some(Pull::Done), None, None, None, None].into_iter();
 
         let mut index = HashMap::new();
@@ -818,7 +748,6 @@ mod tests {
     }
 
     fn rfc3339_today() -> String {
-        // Reverse of `days_ago`, only accurate enough for the round-trip test.
         let mut days = unix_now().unwrap() as i64 / 86_400 + 719_468;
         let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
         days -= era * 146_097;

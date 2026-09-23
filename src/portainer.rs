@@ -1,9 +1,3 @@
-//! Minimal Portainer API client, limited to redeploying a compose stack.
-//!
-//! Authentication is an API token (`X-API-Key`), read from the environment —
-//! never from a command-line flag, because argv is readable by every user on
-//! the host through `ps`. Create one under *My account → Access tokens*.
-
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -12,8 +6,6 @@ use std::time::Duration;
 pub const TOKEN_ENV: &str = "CHECKCHECK_PORTAINER_TOKEN";
 pub const URL_ENV: &str = "CHECKCHECK_PORTAINER_URL";
 
-/// Compose sets this on every container it creates; Portainer uses the stack
-/// name as the project name, which is how a container is traced back to a stack.
 pub const PROJECT_LABEL: &str = "com.docker.compose.project";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,9 +18,6 @@ pub struct Stack {
     pub endpoint_id: i64,
     #[serde(rename = "Env", default)]
     pub env: Vec<EnvVar>,
-    /// Set for stacks Portainer pulls from a repository. Those need the git
-    /// redeploy route instead of a file update, so they are reported as
-    /// unsupported rather than silently redeployed from a stale file.
     #[serde(rename = "GitConfig", default)]
     pub git_config: Option<serde_json::Value>,
 }
@@ -52,8 +41,6 @@ pub struct PortainerClient {
 }
 
 impl PortainerClient {
-    /// Build a client from `CHECKCHECK_PORTAINER_URL` / `CHECKCHECK_PORTAINER_TOKEN`,
-    /// with `url` overriding the environment when given.
     pub fn from_env(url: Option<&str>, timeout_secs: u64, insecure: bool) -> Result<Self> {
         let base = match url {
             Some(url) => url.to_string(),
@@ -87,8 +74,6 @@ impl PortainerClient {
             .context("could not list Portainer stacks")
     }
 
-    /// The compose file exactly as Portainer holds it. A redeploy sends this
-    /// back unchanged — checkcheck never rewrites image tags.
     pub async fn stack_file(&self, id: i64) -> Result<String> {
         #[derive(Deserialize)]
         struct StackFile {
@@ -102,7 +87,6 @@ impl PortainerClient {
         Ok(file.content)
     }
 
-    /// Redeploy a stack from its own stored compose file, pulling images first.
     pub async fn redeploy(&self, stack: &Stack, compose: &str) -> Result<()> {
         let url = format!(
             "{}/api/stacks/{}?endpointId={}",
@@ -146,9 +130,6 @@ impl PortainerClient {
     }
 }
 
-/// The body of a stack update. `env` has to be sent back or Portainer drops the
-/// stack's variables; `prune` stays false, because removing services that are
-/// merely absent from a hand-edited file is not this tool's call to make.
 fn redeploy_body(stack: &Stack, compose: &str) -> serde_json::Value {
     serde_json::json!({
         "stackFileContent": compose,
@@ -158,9 +139,6 @@ fn redeploy_body(stack: &Stack, compose: &str) -> serde_json::Value {
     })
 }
 
-/// Turn a Portainer error into something a human can act on. Its bodies are
-/// `{"message": "...", "details": "..."}`, but error pages are not, so fall
-/// back to the raw text.
 fn describe(status: StatusCode, body: &str) -> String {
     let hint = match status {
         StatusCode::UNAUTHORIZED => {
@@ -252,12 +230,8 @@ mod tests {
         };
         let body = redeploy_body(&stack, "services:\n  app:\n    image: gitea/gitea:latest\n");
 
-        // Portainer pulls the images, so this is what actually moves the stack
-        // onto the new image.
         assert_eq!(body["pullImage"], true);
-        // Pruning would delete services the compose file no longer mentions.
         assert_eq!(body["prune"], false);
-        // Dropping env would wipe the stack's variables on every redeploy.
         assert_eq!(body["env"][0]["name"], "TZ");
         assert_eq!(body["env"][0]["value"], "Europe/Amsterdam");
         assert!(body["stackFileContent"]
