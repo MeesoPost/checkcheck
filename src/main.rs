@@ -4,8 +4,8 @@ mod registry;
 use anyhow::Result;
 use clap::Parser;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use docker::RunningContainer;
@@ -46,12 +46,6 @@ enum Status {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
-enum Pull {
-    Done,
-    Failed(String),
-}
-
 struct Check {
     parsed: Option<ImageRef>,
     local_digest: Option<String>,
@@ -60,7 +54,6 @@ struct Check {
     os: String,
     architecture: String,
     remote_created: Option<String>,
-    pulled: Option<Pull>,
 }
 
 impl Check {
@@ -77,8 +70,7 @@ impl Check {
             first_remote: None,
             os: container.os.clone(),
             architecture: container.architecture.clone(),
-                remote_created: None,
-            pulled: None,
+            remote_created: None,
         }
     }
 
@@ -107,9 +99,8 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    let color = !cli.no_color
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::io::stdout().is_terminal();
+    let color =
+        !cli.no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
 
     let docker = docker::connect().await?;
     let containers = docker::running_containers(&docker).await?;
@@ -214,36 +205,102 @@ async fn run() -> Result<()> {
     }
 
     if cli.pull {
-        pull_updates(&docker, &mut checks).await;
+        pull_updates(&docker, &checks).await;
+    } else {
+        print_report(&containers, &index, &checks, color);
     }
 
-    print_report(&containers, &index, &checks, color);
+    let (stacks, loose) = stacks_to_redeploy(&containers, &index, &checks);
+    if stacks.is_empty() && loose.is_empty() {
+        if cli.pull {
+            println!("Everything up to date — nothing to pull.");
+        }
+    } else {
+        print_stacks(&stacks, &loose, color);
+    }
     Ok(())
 }
 
-async fn pull_updates(docker: &bollard::Docker, checks: &mut [Check]) {
-    let targets: Vec<(usize, String, String)> = checks
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| matches!(c.status, Status::UpdateAvailable { .. }))
-        .filter_map(|(i, c)| {
-            let parsed = c.parsed.as_ref()?;
-            Some((i, parsed.name_no_tag.clone(), parsed.tag.clone()))
-        })
-        .collect();
+async fn pull_updates(docker: &bollard::Docker, checks: &[Check]) {
+    let mut seen: HashSet<String> = HashSet::new();
 
-    let mut done: HashMap<String, Pull> = HashMap::new();
-    for (i, repository, tag) in targets {
-        let reference = format!("{repository}:{tag}");
-        if !done.contains_key(&reference) {
-            eprintln!("pulling {reference}…");
-            let outcome = match docker::pull_image(docker, &repository, &tag).await {
-                Ok(()) => Pull::Done,
-                Err(err) => Pull::Failed(format!("{err:#}")),
-            };
-            done.insert(reference.clone(), outcome);
+    for check in checks {
+        if !matches!(check.status, Status::UpdateAvailable { .. }) {
+            continue;
         }
-        checks[i].pulled = done.get(&reference).cloned();
+        let Some(parsed) = &check.parsed else {
+            continue;
+        };
+
+        let reference = format!("{}:{}", parsed.name_no_tag, parsed.tag);
+        if !seen.insert(reference.clone()) {
+            continue;
+        }
+
+        eprint!("pulling {reference}… ");
+        std::io::stderr().flush().ok();
+        match docker::pull_image(docker, &parsed.name_no_tag, &parsed.tag).await {
+            Ok(()) => eprintln!("ok"),
+            Err(err) => eprintln!("failed: {err:#}"),
+        }
+    }
+}
+
+/// Groups the confirmed updates by their Compose project — the name Portainer
+/// shows as the stack. One outdated container means the whole stack gets
+/// redeployed, so every stack appears once with all its outdated members.
+fn stacks_to_redeploy(
+    containers: &[RunningContainer],
+    index: &HashMap<String, usize>,
+    checks: &[Check],
+) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+    let mut stacks: Vec<(String, Vec<String>)> = Vec::new();
+    let mut loose: Vec<String> = Vec::new();
+
+    for container in containers {
+        if !matches!(
+            checks[index[&container.key()]].status,
+            Status::UpdateAvailable { .. }
+        ) {
+            continue;
+        }
+        match &container.project {
+            Some(project) => match stacks.iter_mut().find(|(name, _)| name == project) {
+                Some((_, members)) => members.push(container.name.clone()),
+                None => stacks.push((project.clone(), vec![container.name.clone()])),
+            },
+            None => loose.push(container.name.clone()),
+        }
+    }
+
+    stacks.sort_by(|a, b| a.0.cmp(&b.0));
+    (stacks, loose)
+}
+
+fn print_stacks(stacks: &[(String, Vec<String>)], loose: &[String], color: bool) {
+    if !stacks.is_empty() {
+        println!("\nRedeploy in Portainer:");
+        let width = stacks
+            .iter()
+            .map(|(name, _)| name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (name, members) in stacks {
+            let pad = " ".repeat(width - name.chars().count());
+            println!(
+                "  {}{} — {}",
+                paint(color, "1", name),
+                pad,
+                members.join(", ")
+            );
+        }
+    }
+
+    if !loose.is_empty() {
+        println!(
+            "\nNot in a stack, restart these yourself: {}",
+            loose.join(", ")
+        );
     }
 }
 
@@ -273,16 +330,9 @@ fn detail_suffix(container: &RunningContainer, check: &Check) -> Option<String> 
             if let Some(built) = &check.remote_created {
                 suffix.push_str(&format!(", built {}{}", short_date(built), age(built)));
             }
-            match &check.pulled {
-                Some(Pull::Done) => suffix.push_str(" — pulled, restart to adopt"),
-                Some(Pull::Failed(err)) => suffix.push_str(&format!(" — pull failed: {err}")),
-                None => {}
-            }
             Some(suffix)
         }
-        Status::Unstable => {
-            Some("unstable — treated as CDN noise, not an update".to_string())
-        }
+        Status::Unstable => Some("unstable — treated as CDN noise, not an update".to_string()),
         Status::NoDigest => Some("no registry digest (built or imported locally)".to_string()),
         Status::Pinned => Some("pinned to a digest".to_string()),
         Status::Error(msg) => Some(msg.clone()),
@@ -358,7 +408,87 @@ mod tests {
             repo_digests: Vec::new(),
             os: "linux".to_string(),
             architecture: "amd64".to_string(),
+            project: None,
         }
+    }
+
+    fn in_stack(name: &str, project: Option<&str>) -> RunningContainer {
+        RunningContainer {
+            project: project.map(str::to_string),
+            ..container(name, &format!("{name}:latest"), &format!("sha256:{name}"))
+        }
+    }
+
+    fn checks_for(
+        containers: &[RunningContainer],
+        statuses: Vec<Status>,
+    ) -> (HashMap<String, usize>, Vec<Check>) {
+        let mut index = HashMap::new();
+        let mut checks = Vec::new();
+        for (i, (c, status)) in containers.iter().zip(statuses).enumerate() {
+            index.insert(c.key(), i);
+            let mut check = Check::for_container(c);
+            check.status = status;
+            checks.push(check);
+        }
+        (index, checks)
+    }
+
+    fn update() -> Status {
+        Status::UpdateAvailable {
+            remote: "sha256:1111111111111111".to_string(),
+        }
+    }
+
+    #[test]
+    fn groups_updates_by_stack() {
+        let containers = vec![
+            in_stack("plex", Some("media")),
+            in_stack("tautulli", Some("media")),
+            in_stack("beszel", Some("beszel")),
+            in_stack("loose", None),
+            in_stack("gitea", Some("gitea")),
+        ];
+        let (index, checks) = checks_for(
+            &containers,
+            vec![update(), update(), update(), update(), Status::UpToDate],
+        );
+
+        let (stacks, loose) = stacks_to_redeploy(&containers, &index, &checks);
+
+        assert_eq!(
+            stacks.len(),
+            2,
+            "gitea is up to date, so its stack stays out"
+        );
+        assert_eq!(stacks[0].0, "beszel");
+        assert_eq!(stacks[1].0, "media");
+        assert_eq!(
+            stacks[1].1,
+            vec!["plex", "tautulli"],
+            "one stack, both outdated members listed"
+        );
+        assert_eq!(loose, vec!["loose"]);
+    }
+
+    #[test]
+    fn one_outdated_container_pulls_in_its_whole_stack() {
+        let containers = vec![
+            in_stack("sonarr", Some("media")),
+            in_stack("radarr", Some("media")),
+        ];
+        let (index, checks) = checks_for(&containers, vec![update(), Status::UpToDate]);
+
+        let (stacks, loose) = stacks_to_redeploy(&containers, &index, &checks);
+
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].0, "media");
+        assert_eq!(
+            stacks[0].1,
+            vec!["sonarr"],
+            "radarr is current, so not named"
+        );
+        assert!(loose.is_empty());
     }
 
     #[test]
@@ -387,8 +517,6 @@ mod tests {
             Status::Pinned,
         ];
 
-        let mut pulls = [None, Some(Pull::Done), None, None, None, None].into_iter();
-
         let mut index = HashMap::new();
         let mut checks = Vec::new();
         for (i, (c, status)) in containers.iter().zip(statuses).enumerate() {
@@ -397,7 +525,6 @@ mod tests {
             check.status = status;
             check.local_digest = Some("sha256:0000000000000000".to_string());
             check.remote_created = Some("2026-09-10T08:00:00Z".to_string());
-            check.pulled = pulls.next().flatten();
             checks.push(check);
         }
 

@@ -6,6 +6,10 @@ use bollard::{Docker, API_DEFAULT_VERSION};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 
+/// Label Docker Compose puts on every container it creates; its value is the
+/// stack name Portainer shows.
+pub const PROJECT_LABEL: &str = "com.docker.compose.project";
+
 #[derive(Debug, Clone)]
 pub struct RunningContainer {
     pub name: String,
@@ -14,6 +18,7 @@ pub struct RunningContainer {
     pub repo_digests: Vec<String>,
     pub os: String,
     pub architecture: String,
+    pub project: Option<String>,
 }
 
 impl RunningContainer {
@@ -89,6 +94,7 @@ pub async fn running_containers(docker: &Docker) -> Result<Vec<RunningContainer>
 
     for summary in summaries {
         let name = container_name(&summary);
+        let project = compose_project(&summary);
         let image_id = summary.image_id.clone().unwrap_or_default();
         let image = image_reference(docker, &summary).await;
         if image.is_empty() || image_id.is_empty() {
@@ -111,6 +117,7 @@ pub async fn running_containers(docker: &Docker) -> Result<Vec<RunningContainer>
             repo_digests: meta.repo_digests,
             os: meta.os,
             architecture: meta.architecture,
+            project,
         });
     }
 
@@ -125,6 +132,15 @@ fn container_name(summary: &ContainerSummary) -> String {
         .and_then(|names| names.first())
         .map(|n| n.trim_start_matches('/').to_string())
         .unwrap_or_else(|| "<unnamed>".to_string())
+}
+
+fn compose_project(summary: &ContainerSummary) -> Option<String> {
+    summary
+        .labels
+        .as_ref()?
+        .get(PROJECT_LABEL)
+        .filter(|project| !project.is_empty())
+        .cloned()
 }
 
 async fn image_reference(docker: &Docker, summary: &ContainerSummary) -> String {
