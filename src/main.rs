@@ -1,16 +1,14 @@
 mod docker;
-mod portainer;
 mod registry;
 
 use anyhow::Result;
 use clap::Parser;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::IsTerminal;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use docker::RunningContainer;
-use portainer::{PortainerClient, Stack};
 use registry::{ImageRef, RegistryClient};
 
 #[derive(Parser, Debug)]
@@ -28,33 +26,9 @@ struct Cli {
     #[arg(long, default_value_t = 15, value_name = "SECONDS")]
     timeout: u64,
 
-    /// Only check containers whose name contains this substring
-    #[arg(long, value_name = "SUBSTRING")]
-    filter: Option<String>,
-
-    /// Machine-readable output
-    #[arg(long)]
-    json: bool,
-
     /// Pull confirmed updates into the local image store (does not restart anything)
     #[arg(long)]
     pull: bool,
-
-    /// Redeploy the Portainer stack of every confirmed update, after asking
-    #[arg(long)]
-    redeploy: bool,
-
-    /// Portainer base URL, e.g. https://portainer.local:9443 (or $CHECKCHECK_PORTAINER_URL)
-    #[arg(long, value_name = "URL")]
-    portainer_url: Option<String>,
-
-    /// Skip TLS verification for Portainer (only for a self-signed certificate)
-    #[arg(long)]
-    portainer_insecure: bool,
-
-    /// Exit with code 10 when at least one update is available
-    #[arg(long)]
-    exit_code: bool,
 
     /// Never colourise the output
     #[arg(long)]
@@ -66,7 +40,7 @@ enum Status {
     Pending,
     UpToDate,
     UpdateAvailable { remote: String },
-    Unstable { first: String, second: String },
+    Unstable,
     Pinned,
     NoDigest,
     Error(String),
@@ -85,7 +59,6 @@ struct Check {
     first_remote: Option<String>,
     os: String,
     architecture: String,
-    local_created: Option<String>,
     remote_created: Option<String>,
     pulled: Option<Pull>,
 }
@@ -104,8 +77,7 @@ impl Check {
             first_remote: None,
             os: container.os.clone(),
             architecture: container.architecture.clone(),
-            local_created: container.created.clone(),
-            remote_created: None,
+                remote_created: None,
             pulled: None,
         }
     }
@@ -135,34 +107,15 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    let color = !cli.json
-        && !cli.no_color
+    let color = !cli.no_color
         && std::env::var_os("NO_COLOR").is_none()
         && std::io::stdout().is_terminal();
 
-    let portainer = cli
-        .redeploy
-        .then(|| {
-            PortainerClient::from_env(
-                cli.portainer_url.as_deref(),
-                cli.timeout,
-                cli.portainer_insecure,
-            )
-        })
-        .transpose()?;
-
     let docker = docker::connect().await?;
-    let mut containers = docker::running_containers(&docker).await?;
-    if let Some(needle) = &cli.filter {
-        containers.retain(|c| c.name.contains(needle.as_str()));
-    }
+    let containers = docker::running_containers(&docker).await?;
 
     if containers.is_empty() {
-        if cli.json {
-            println!("{}", serde_json::json!({ "containers": [] }));
-        } else {
-            println!("No running containers to check.");
-        }
+        println!("No running containers to check.");
         return Ok(());
     }
 
@@ -181,13 +134,11 @@ async fn run() -> Result<()> {
         .filter(|c| matches!(c.status, Status::Pending))
         .count();
 
-    if !cli.json {
-        eprintln!(
-            "checkcheck — {} running container(s), {} image(s) to check…",
-            containers.len(),
-            to_check
-        );
-    }
+    eprintln!(
+        "checkcheck — {} running container(s), {} image(s) to check…",
+        containers.len(),
+        to_check
+    );
 
     let mut client = RegistryClient::new(cli.timeout)?;
 
@@ -213,13 +164,11 @@ async fn run() -> Result<()> {
         .collect();
 
     if !read_once.is_empty() && cli.delay > 0 {
-        if !cli.json {
-            eprintln!(
-                "{} image(s) checked — confirming in {}s to filter out registry noise…",
-                read_once.len(),
-                cli.delay
-            );
-        }
+        eprintln!(
+            "{} image(s) checked — confirming in {}s to filter out registry noise…",
+            read_once.len(),
+            cli.delay
+        );
         tokio::time::sleep(Duration::from_secs(cli.delay)).await;
     }
 
@@ -249,7 +198,7 @@ async fn run() -> Result<()> {
             Ok(second) if first != local && second == first => {
                 Status::UpdateAvailable { remote: first }
             }
-            Ok(second) => Status::Unstable { first, second },
+            Ok(_) => Status::Unstable,
             Err(err) => Status::Error(format!("confirmation pass failed: {err:#}")),
         };
     }
@@ -265,30 +214,14 @@ async fn run() -> Result<()> {
     }
 
     if cli.pull {
-        pull_updates(&docker, &mut checks, cli.json).await;
+        pull_updates(&docker, &mut checks).await;
     }
 
-    if cli.json {
-        print_json(&containers, &index, &checks);
-    } else {
-        print_report(&containers, &index, &checks, color);
-    }
-
-    if let Some(client) = &portainer {
-        redeploy_stacks(client, &containers, &index, &checks).await?;
-    }
-
-    if cli.exit_code
-        && checks
-            .iter()
-            .any(|c| matches!(c.status, Status::UpdateAvailable { .. }))
-    {
-        std::process::exit(10);
-    }
+    print_report(&containers, &index, &checks, color);
     Ok(())
 }
 
-async fn pull_updates(docker: &bollard::Docker, checks: &mut [Check], json: bool) {
+async fn pull_updates(docker: &bollard::Docker, checks: &mut [Check]) {
     let targets: Vec<(usize, String, String)> = checks
         .iter()
         .enumerate()
@@ -303,9 +236,7 @@ async fn pull_updates(docker: &bollard::Docker, checks: &mut [Check], json: bool
     for (i, repository, tag) in targets {
         let reference = format!("{repository}:{tag}");
         if !done.contains_key(&reference) {
-            if !json {
-                eprintln!("pulling {reference}…");
-            }
+            eprintln!("pulling {reference}…");
             let outcome = match docker::pull_image(docker, &repository, &tag).await {
                 Ok(()) => Pull::Done,
                 Err(err) => Pull::Failed(format!("{err:#}")),
@@ -314,130 +245,6 @@ async fn pull_updates(docker: &bollard::Docker, checks: &mut [Check], json: bool
         }
         checks[i].pulled = done.get(&reference).cloned();
     }
-}
-
-struct Target {
-    stack: Stack,
-    containers: Vec<String>,
-}
-
-async fn redeploy_stacks(
-    client: &PortainerClient,
-    containers: &[RunningContainer],
-    index: &HashMap<String, usize>,
-    checks: &[Check],
-) -> Result<()> {
-    let outdated: Vec<&RunningContainer> = containers
-        .iter()
-        .filter(|c| {
-            matches!(
-                checks[index[&c.key()]].status,
-                Status::UpdateAvailable { .. }
-            )
-        })
-        .collect();
-
-    if outdated.is_empty() {
-        println!("\nNothing to redeploy.");
-        return Ok(());
-    }
-
-    let stacks = client.stacks().await?;
-
-    let (targets, unmanaged) = plan_redeploy(&outdated, &stacks);
-
-    if !unmanaged.is_empty() {
-        println!(
-            "\nNot in a Portainer stack, update these yourself: {}",
-            unmanaged.join(", ")
-        );
-    }
-
-    let (git_backed, targets): (Vec<Target>, Vec<Target>) =
-        targets.into_iter().partition(|t| t.stack.is_git_backed());
-    for target in &git_backed {
-        println!(
-            "Stack `{}` deploys from git — redeploy it from Portainer instead.",
-            target.stack.name
-        );
-    }
-
-    if targets.is_empty() {
-        return Ok(());
-    }
-
-    println!("\nAbout to redeploy {} stack(s):", targets.len());
-    for target in &targets {
-        println!(
-            "  {} (stack {}, environment {}) — for {}",
-            target.stack.name,
-            target.stack.id,
-            target.stack.endpoint_id,
-            target.containers.join(", ")
-        );
-    }
-    println!("Every container in these stacks restarts. Expect brief downtime.");
-
-    if !confirm("Redeploy? [y/N] ")? {
-        println!("Cancelled — nothing was redeployed.");
-        return Ok(());
-    }
-
-    for target in &targets {
-        let name = &target.stack.name;
-        print!("redeploying {name}… ");
-        std::io::stdout().flush().ok();
-
-        let result = match client.stack_file(target.stack.id).await {
-            Ok(compose) => client.redeploy(&target.stack, &compose).await,
-            Err(err) => Err(err),
-        };
-        match result {
-            Ok(()) => println!("done"),
-            Err(err) => println!("failed: {err:#}"),
-        }
-    }
-    Ok(())
-}
-
-fn plan_redeploy(outdated: &[&RunningContainer], stacks: &[Stack]) -> (Vec<Target>, Vec<String>) {
-    let mut targets: Vec<Target> = Vec::new();
-    let mut unmanaged: Vec<String> = Vec::new();
-
-    for container in outdated {
-        let stack = container
-            .project
-            .as_deref()
-            .and_then(|project| stacks.iter().find(|s| s.name.eq_ignore_ascii_case(project)));
-
-        match stack {
-            Some(stack) => match targets.iter_mut().find(|t| t.stack.id == stack.id) {
-                Some(target) => target.containers.push(container.name.clone()),
-                None => targets.push(Target {
-                    stack: stack.clone(),
-                    containers: vec![container.name.clone()],
-                }),
-            },
-            None => unmanaged.push(container.name.clone()),
-        }
-    }
-    (targets, unmanaged)
-}
-
-fn confirm(prompt: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() {
-        println!("Not running on a terminal — refusing to redeploy without confirmation.");
-        return Ok(false);
-    }
-    print!("{prompt}");
-    std::io::stdout().flush().ok();
-
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
 }
 
 fn print_report(
@@ -473,7 +280,7 @@ fn detail_suffix(container: &RunningContainer, check: &Check) -> Option<String> 
             }
             Some(suffix)
         }
-        Status::Unstable { .. } => {
+        Status::Unstable => {
             Some("unstable — treated as CDN noise, not an update".to_string())
         }
         Status::NoDigest => Some("no registry digest (built or imported locally)".to_string()),
@@ -524,72 +331,11 @@ fn icon_for(status: &Status) -> (&'static str, &'static str) {
     match status {
         Status::UpToDate => ("✅", "1;32"),
         Status::UpdateAvailable { .. } => ("🔄", "1"),
-        Status::Unstable { .. } => ("🌀", ""),
+        Status::Unstable => ("🌀", ""),
         Status::Pinned => ("🔒", ""),
         Status::NoDigest | Status::Pending => ("➖", ""),
         Status::Error(_) => ("❌", "1;31"),
     }
-}
-
-fn print_json(containers: &[RunningContainer], index: &HashMap<String, usize>, checks: &[Check]) {
-    let rows: Vec<serde_json::Value> = containers
-        .iter()
-        .map(|container| {
-            let check = &checks[index[&container.key()]];
-            let (status, remote, detail) = match &check.status {
-                Status::UpToDate => ("up_to_date", None, None),
-                Status::UpdateAvailable { remote } => {
-                    ("update_available", Some(remote.clone()), None)
-                }
-                Status::Unstable { first, second } => (
-                    "unstable",
-                    Some(first.clone()),
-                    Some(format!("second pass returned {second}")),
-                ),
-                Status::Pinned => ("pinned", None, None),
-                Status::NoDigest => ("no_digest", None, None),
-                Status::Pending => ("not_checked", None, None),
-                Status::Error(msg) => ("error", None, Some(msg.clone())),
-            };
-
-            serde_json::json!({
-                "container": container.name,
-                "image": container.image,
-                "image_id": container.image_id,
-                "status": status,
-                "local_digest": check.local_digest,
-                "remote_digest": remote,
-                "local_built_at": check.local_created,
-                "remote_built_at": check.remote_created,
-                "pulled": match &check.pulled {
-                    Some(Pull::Done) => Some(true),
-                    Some(Pull::Failed(_)) => Some(false),
-                    None => None,
-                },
-                "pull_error": match &check.pulled {
-                    Some(Pull::Failed(err)) => Some(err.clone()),
-                    _ => None,
-                },
-                "detail": detail,
-            })
-        })
-        .collect();
-
-    let updates = rows
-        .iter()
-        .filter(|r| r["status"] == "update_available")
-        .count();
-
-    let output = serde_json::json!({
-        "checked_at_unix": unix_now().unwrap_or(0),
-        "containers": rows,
-        "summary": { "update_available": updates },
-    });
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output).unwrap_or_default()
-    );
 }
 
 fn paint(color: bool, code: &str, text: &str) -> String {
@@ -604,75 +350,6 @@ fn paint(color: bool, code: &str, text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn stack(id: i64, name: &str, git: bool) -> Stack {
-        Stack {
-            id,
-            name: name.to_string(),
-            endpoint_id: 2,
-            env: Vec::new(),
-            git_config: git.then(|| serde_json::json!({"URL": "https://example.invalid"})),
-        }
-    }
-
-    fn in_project(name: &str, project: Option<&str>) -> RunningContainer {
-        RunningContainer {
-            project: project.map(str::to_string),
-            ..container(name, "nginx:latest", "sha256:aaa")
-        }
-    }
-
-    #[test]
-    fn groups_containers_by_their_stack() {
-        let stacks = vec![stack(7, "media", false), stack(8, "gitea", false)];
-        let containers = [
-            in_project("sonarr", Some("media")),
-            in_project("radarr", Some("media")),
-            in_project("gitea", Some("gitea")),
-        ];
-        let refs: Vec<&RunningContainer> = containers.iter().collect();
-
-        let (targets, unmanaged) = plan_redeploy(&refs, &stacks);
-        assert!(unmanaged.is_empty());
-        assert_eq!(targets.len(), 2, "two stacks, one redeploy each");
-        assert_eq!(targets[0].containers, vec!["sonarr", "radarr"]);
-        assert_eq!(targets[1].containers, vec!["gitea"]);
-    }
-
-    #[test]
-    fn matches_a_stack_name_case_insensitively() {
-        let stacks = vec![stack(7, "Media", false)];
-        let containers = [in_project("sonarr", Some("media"))];
-        let refs: Vec<&RunningContainer> = containers.iter().collect();
-
-        let (targets, unmanaged) = plan_redeploy(&refs, &stacks);
-        assert!(unmanaged.is_empty());
-        assert_eq!(targets.len(), 1);
-    }
-
-    #[test]
-    fn reports_containers_that_no_stack_claims() {
-        let stacks = vec![stack(7, "media", false)];
-        let containers = [
-            in_project("loose", None),
-            in_project("other", Some("not-a-portainer-stack")),
-        ];
-        let refs: Vec<&RunningContainer> = containers.iter().collect();
-
-        let (targets, unmanaged) = plan_redeploy(&refs, &stacks);
-        assert!(targets.is_empty());
-        assert_eq!(unmanaged, vec!["loose", "other"]);
-    }
-
-    #[test]
-    fn keeps_git_backed_stacks_separable() {
-        let stacks = vec![stack(7, "media", true)];
-        let containers = [in_project("sonarr", Some("media"))];
-        let refs: Vec<&RunningContainer> = containers.iter().collect();
-
-        let (targets, _) = plan_redeploy(&refs, &stacks);
-        assert!(targets[0].stack.is_git_backed());
-    }
-
     fn container(name: &str, image: &str, id: &str) -> RunningContainer {
         RunningContainer {
             name: name.to_string(),
@@ -681,8 +358,6 @@ mod tests {
             repo_digests: Vec::new(),
             os: "linux".to_string(),
             architecture: "amd64".to_string(),
-            created: Some("2026-06-01T12:00:00Z".to_string()),
-            project: None,
         }
     }
 
@@ -707,10 +382,7 @@ mod tests {
                 remote: "sha256:1111111111111111".to_string(),
             },
             Status::Error("registry rate limit reached (HTTP 429)".to_string()),
-            Status::Unstable {
-                first: "sha256:2222222222222222".to_string(),
-                second: "sha256:3333333333333333".to_string(),
-            },
+            Status::Unstable,
             Status::NoDigest,
             Status::Pinned,
         ];
@@ -730,7 +402,6 @@ mod tests {
         }
 
         print_report(&containers, &index, &checks, false);
-        print_json(&containers, &index, &checks);
     }
 
     #[test]

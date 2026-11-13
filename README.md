@@ -20,12 +20,8 @@ Geen root nodig, mits je gebruiker in de `docker` group zit.
 
 ```bash
 checkcheck                    # standaard: twee passes, 5 seconden ertussen
+checkcheck --pull             # check, daarna alle updates binnenhalen
 checkcheck --delay 0          # snel, één pass
-checkcheck --filter arr       # alleen containers met "arr" in de naam
-checkcheck --pull             # updates binnenhalen (herstart niets)
-checkcheck --redeploy         # Portainer-stack uitrollen, na bevestiging
-checkcheck --json             # machineleesbaar
-checkcheck --exit-code        # exit 10 als er updates zijn
 ```
 
 ```
@@ -37,25 +33,22 @@ checkcheck --exit-code        # exit 10 als er updates zijn
 ❌ paperless — registry rate limit reached (HTTP 429)
 ```
 
-## Portainer
+## Pullen
 
-`--redeploy` rolt de stack opnieuw uit van elke container met een bevestigde
-update. Portainer haalt de images daarbij zelf op, dus `--pull` is geen
-voorwaarde — samen gebruiken zet het downloaden wel vóór de downtime.
+`--pull` haalt **elke** bevestigde update binnen — alles met 🔄, in één keer.
+Er is geen vlag om te selecteren: wat 🌀, ➖, 🔒 of ❌ is blijft met rust.
 
-```bash
-export CHECKCHECK_PORTAINER_URL=https://portainer.local:9443
-export CHECKCHECK_PORTAINER_TOKEN=ptr_...
-checkcheck --redeploy
+```
+🔄 tautulli — lscr.io/linuxserver/tautulli:latest, built 2026-11-10 (3 days ago) — pulled, restart to adopt
 ```
 
-Het token komt alleen uit de omgeving, nooit uit een vlag: argv is via `ps` voor
-elke gebruiker op de host leesbaar. Bij een self-signed certificaat:
-`--portainer-insecure`.
+Draaien er meerdere containers op hetzelfde image, dan wordt dat image één keer
+gepulld. Een mislukte pull stopt de rest niet; die container krijgt
+`pull failed: …` achter zijn regel.
 
-Er wordt altijd om bevestiging gevraagd en zonder terminal weigert het. Het
-compose-bestand gaat ongewijzigd terug, `prune` staat uit, en git-gebaseerde
-stacks worden overgeslagen.
+Er wordt geen container aangeraakt. Het nieuwe image staat daarna in de lokale
+store, de container draait door op het oude tot je hem zelf herstart of de stack
+opnieuw uitrolt.
 
 ## Beperkingen
 
@@ -65,14 +58,11 @@ stacks worden overgeslagen.
   `RepoDigest` onder hun eigen naam. Checkcheck kan ze daardoor niet van
   gepullde images onderscheiden en vraagt ze op bij de registry, wat een 404 of
   een 401 oplevert in plaats van "lokaal gebouwd".
-- Een geslaagde redeploy betekent "aangenomen", niet "draait en is gezond".
-  Er is geen health-check en geen rollback.
 
 ## Structuur
 
 | Bestand | Rol |
 |---|---|
-| `src/main.rs` | CLI, statusbepaling, rapport |
+| `src/main.rs` | CLI, statusbepaling, rapport, pull |
 | `src/docker.rs` | Daemon-verbinding, containers, pull |
 | `src/registry.rs` | Registry v2: digests en build-datums |
-| `src/portainer.rs` | Stacks ophalen en redeployen |

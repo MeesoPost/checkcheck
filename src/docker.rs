@@ -14,8 +14,6 @@ pub struct RunningContainer {
     pub repo_digests: Vec<String>,
     pub os: String,
     pub architecture: String,
-    pub created: Option<String>,
-    pub project: Option<String>,
 }
 
 impl RunningContainer {
@@ -29,7 +27,6 @@ struct ImageMeta {
     repo_digests: Vec<String>,
     os: String,
     architecture: String,
-    created: Option<String>,
 }
 
 pub async fn connect() -> Result<Docker> {
@@ -92,7 +89,6 @@ pub async fn running_containers(docker: &Docker) -> Result<Vec<RunningContainer>
 
     for summary in summaries {
         let name = container_name(&summary);
-        let project = compose_project(&summary);
         let image_id = summary.image_id.clone().unwrap_or_default();
         let image = image_reference(docker, &summary).await;
         if image.is_empty() || image_id.is_empty() {
@@ -115,8 +111,6 @@ pub async fn running_containers(docker: &Docker) -> Result<Vec<RunningContainer>
             repo_digests: meta.repo_digests,
             os: meta.os,
             architecture: meta.architecture,
-            created: meta.created,
-            project,
         });
     }
 
@@ -131,15 +125,6 @@ fn container_name(summary: &ContainerSummary) -> String {
         .and_then(|names| names.first())
         .map(|n| n.trim_start_matches('/').to_string())
         .unwrap_or_else(|| "<unnamed>".to_string())
-}
-
-fn compose_project(summary: &ContainerSummary) -> Option<String> {
-    summary
-        .labels
-        .as_ref()?
-        .get(crate::portainer::PROJECT_LABEL)
-        .filter(|project| !project.is_empty())
-        .cloned()
 }
 
 async fn image_reference(docker: &Docker, summary: &ContainerSummary) -> String {
@@ -164,7 +149,6 @@ async fn image_meta(docker: &Docker, image_id: &str) -> ImageMeta {
         repo_digests: info.repo_digests.unwrap_or_default(),
         os: info.os.unwrap_or_default(),
         architecture: info.architecture.unwrap_or_default(),
-        created: info.created,
     }
 }
 
