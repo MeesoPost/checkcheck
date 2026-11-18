@@ -59,22 +59,40 @@ Not in a stack, restart these yourself: homegrown
 is geen vlag om te selecteren: wat 🌀, ➖, 🔒 of ❌ is blijft met rust.
 
 Omdat je daarna toch naar Portainer gaat, vervalt bij `--pull` het
-regel-per-container rapport. Je ziet de pulls en wat je moet redeployen:
+regel-per-container rapport. In plaats daarvan zie je de pull zelf, laag voor
+laag, zoals `docker pull` hem toont:
 
 ```
-pulling henrygd/beszel:latest… ok
-pulling henrygd/beszel-agent:latest… ok
-pulling lscr.io/linuxserver/plex:latest… ok
-pulling lscr.io/linuxserver/tautulli:latest… failed: registry rate limit reached (HTTP 429)
+→ lscr.io/linuxserver/tautulli:latest
+latest: Pulling from linuxserver/tautulli
+a1b2c3d4e5f6: Already exists
+b2c3d4e5f6a7: Downloading [=========>         ]  12.3MB/24.1MB
+c3d4e5f6a7b8: Download complete
+d4e5f6a7b8c9: Extracting  [===============>   ]  41.2MB/52.7MB
+Digest: sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+Status: Downloaded newer image for lscr.io/linuxserver/tautulli:latest
 
 Redeploy in Portainer:
   beszel — beszel, beszel-agent
   media  — plex, tautulli
 ```
 
+De voortgangsbalken komen kant-en-klaar van de Docker-daemon; checkcheck houdt
+alleen bij welke laag op welke regel staat en herschrijft die regel ter plekke.
+Een image met veel lagen wordt afgekapt op twintig regels plus een samenvatting,
+zodat het blok in een normale terminal past.
+
+Zonder terminal — in een pipe, een cronjob of een logbestand — werkt dat
+herschrijven niet, want het gebruikt cursorcodes. Daar krijg je één regel per
+statuswijziging en worden de voortgangsbalken overgeslagen.
+
+De voortgang gaat naar stderr en de stacklijst naar stdout, dus
+`checkcheck --pull > stacks.txt` levert alleen de lijst op.
+
 Draaien er meerdere containers op hetzelfde image, dan wordt dat image één keer
-gepulld. Een mislukte pull stopt de rest niet en haalt de stack niet uit de
-lijst: Portainer pullt bij een redeploy zelf.
+gepulld. Mislukt een pull, dan verschijnt `failed: …` onder het blok; de rest
+gaat gewoon door en de stack blijft op de lijst staan, want Portainer pullt bij
+een redeploy zelf.
 
 Er wordt geen container aangeraakt. Het nieuwe image staat daarna in de lokale
 store, de container draait door op het oude tot je de stack opnieuw uitrolt.
@@ -96,5 +114,5 @@ Ruim oude images af en toe op met `docker image prune`.
 | Bestand | Rol |
 |---|---|
 | `src/main.rs` | CLI, statusbepaling, rapport, pull, stackgroepering |
-| `src/docker.rs` | Daemon-verbinding, containers, compose-label, pull |
+| `src/docker.rs` | Daemon-verbinding, containers, compose-label, pull + voortgang |
 | `src/registry.rs` | Registry v2: digests en build-datums |

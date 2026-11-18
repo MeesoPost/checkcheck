@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use docker::RunningContainer;
@@ -222,6 +222,9 @@ async fn run() -> Result<()> {
 }
 
 async fn pull_updates(docker: &bollard::Docker, checks: &[Check]) {
+    // Het laag-voor-laag blok herschrijft regels met cursorcodes; dat kan
+    // alleen op een echte terminal.
+    let tty = std::io::stderr().is_terminal();
     let mut seen: HashSet<String> = HashSet::new();
 
     for check in checks {
@@ -237,11 +240,9 @@ async fn pull_updates(docker: &bollard::Docker, checks: &[Check]) {
             continue;
         }
 
-        eprint!("pulling {reference}… ");
-        std::io::stderr().flush().ok();
-        match docker::pull_image(docker, &parsed.name_no_tag, &parsed.tag).await {
-            Ok(()) => eprintln!("ok"),
-            Err(err) => eprintln!("failed: {err:#}"),
+        eprintln!("\n→ {reference}");
+        if let Err(err) = docker::pull_image(docker, &parsed.name_no_tag, &parsed.tag, tty).await {
+            eprintln!("failed: {err:#}");
         }
     }
 }
