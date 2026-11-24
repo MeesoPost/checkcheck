@@ -67,9 +67,9 @@ laag, zoals `docker pull` hem toont:
 → lscr.io/linuxserver/tautulli:latest
 latest: Pulling from linuxserver/tautulli
 a1b2c3d4e5f6: Already exists
-b2c3d4e5f6a7: Downloading [=========>         ]  12.3MB/24.1MB
+b2c3d4e5f6a7: Downloading [=========>              ] 12.3MB/24.1MB
 c3d4e5f6a7b8: Download complete
-d4e5f6a7b8c9: Extracting  [===============>   ]  41.2MB/52.7MB
+d4e5f6a7b8c9: Extracting [===============>        ] 41.2MB/52.7MB
 Digest: sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 Status: Downloaded newer image for lscr.io/linuxserver/tautulli:latest
 
@@ -78,14 +78,19 @@ Redeploy in Portainer:
   media  — plex, tautulli
 ```
 
-De voortgangsbalken komen kant-en-klaar van de Docker-daemon; checkcheck houdt
-alleen bij welke laag op welke regel staat en herschrijft die regel ter plekke.
-Een image met veel lagen wordt afgekapt op twintig regels plus een samenvatting,
-zodat het blok in een normale terminal past.
+De daemon stuurt geen kant-en-klare balken mee, alleen het aantal gedownloade
+en te downloaden bytes per laag; de balk in `docker pull` wordt door de Docker
+CLI zelf getekend. Checkcheck doet hetzelfde: hij tekent de balk uit die
+getallen en herschrijft de regel van die laag ter plekke. Is het totaal
+onbekend, dan blijft het bij het aantal bytes, want een balk zonder noemer
+suggereert een voortgang die er niet is. Een image met veel lagen wordt
+afgekapt op twintig regels plus een samenvatting, zodat het blok in een normale
+terminal past.
 
 Zonder terminal — in een pipe, een cronjob of een logbestand — werkt dat
 herschrijven niet, want het gebruikt cursorcodes. Daar krijg je één regel per
-statuswijziging en worden de voortgangsbalken overgeslagen.
+statuswijziging en worden de voortgangsbalken overgeslagen, zodat een logbestand
+niet volloopt met honderden tussenstanden per laag.
 
 De voortgang gaat naar stderr en de stacklijst naar stdout, dus
 `checkcheck --pull > stacks.txt` levert alleen de lijst op.

@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use bollard::container::ListContainersOptions;
 use bollard::image::CreateImageOptions;
-use bollard::models::{ContainerSummary, CreateImageInfo};
+use bollard::models::{ContainerSummary, CreateImageInfo, ProgressDetail};
 use bollard::{Docker, API_DEFAULT_VERSION};
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -174,6 +174,62 @@ async fn image_meta(docker: &Docker, image_id: &str) -> ImageMeta {
 /// image met veel lagen door zichzelf heen gaan lopen.
 const MAX_LAYER_LINES: usize = 20;
 
+/// Breedte van de voortgangsbalk in tekens.
+const BAR_WIDTH: usize = 24;
+
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let bytes = bytes.max(0);
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+/// Tekent de balk die de daemon zelf niet meestuurt: die geeft alleen
+/// `progressDetail`, en de balk in `docker pull` wordt door de CLI gemaakt.
+/// Zonder bekend totaal blijft het bij het aantal bytes, want een balk zonder
+/// noemer suggereert een voortgang die er niet is.
+fn progress_bar(detail: Option<&ProgressDetail>) -> Option<String> {
+    let detail = detail?;
+    let current = detail.current?;
+
+    let Some(total) = detail.total.filter(|total| *total > 0) else {
+        return (current > 0).then(|| human_bytes(current));
+    };
+
+    let done = current.clamp(0, total) as f64 / total as f64;
+    let filled = (done * BAR_WIDTH as f64).round() as usize;
+
+    let mut bar = String::with_capacity(BAR_WIDTH + 2);
+    bar.push('[');
+    for slot in 1..=BAR_WIDTH {
+        bar.push(
+            if slot < filled || (slot == filled && filled == BAR_WIDTH) {
+                '='
+            } else if slot == filled {
+                '>'
+            } else {
+                ' '
+            },
+        );
+    }
+    bar.push(']');
+
+    Some(format!(
+        "{bar} {}/{}",
+        human_bytes(current),
+        human_bytes(total)
+    ))
+}
+
 /// Bouwt de weergave van `docker pull` na: één regel per laag, die ter plekke
 /// wordt herschreven terwijl de daemon voortgang stuurt. Zonder TTY kan dat
 /// niet, en valt het terug op één regel per statuswijziging — de
@@ -202,8 +258,15 @@ impl PullRender {
 
         match info.id.as_deref().filter(|id| !id.is_empty()) {
             Some(id) => {
-                let line = match info.progress.as_deref().filter(|p| !p.is_empty()) {
-                    Some(progress) => format!("{id}: {status} {progress}"),
+                let bar = info
+                    .progress
+                    .as_deref()
+                    .filter(|progress| !progress.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| progress_bar(info.progress_detail.as_ref()));
+
+                let line = match &bar {
+                    Some(bar) => format!("{id}: {status} {bar}"),
                     None => format!("{id}: {status}"),
                 };
 
@@ -215,7 +278,7 @@ impl PullRender {
 
                 if self.tty {
                     self.redraw();
-                } else if changed && info.progress.is_none() {
+                } else if changed && bar.is_none() {
                     eprintln!("{line}");
                 }
             }
@@ -352,6 +415,57 @@ mod tests {
             render.drawn,
             MAX_LAYER_LINES + 1,
             "het maximum aan laagregels plus de regel die de rest samenvat"
+        );
+    }
+
+    fn detail(id: &str, status: &str, current: i64, total: Option<i64>) -> CreateImageInfo {
+        CreateImageInfo {
+            id: Some(id.to_string()),
+            status: Some(status.to_string()),
+            progress_detail: Some(ProgressDetail {
+                current: Some(current),
+                total,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn draws_its_own_bar_when_the_daemon_only_sends_byte_counts() {
+        let mut render = PullRender::new(false);
+        render.update(&detail("a1b2", "Downloading", 1_048_576, Some(3_359_301)));
+        assert_eq!(
+            render.lines["a1b2"],
+            "a1b2: Downloading [======>                 ] 1.0MB/3.4MB"
+        );
+    }
+
+    #[test]
+    fn a_finished_layer_fills_the_whole_bar() {
+        let mut render = PullRender::new(false);
+        render.update(&detail("a1b2", "Downloading", 4_000, Some(4_000)));
+        assert_eq!(
+            render.lines["a1b2"],
+            "a1b2: Downloading [========================] 4.0kB/4.0kB"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_bytes_when_the_total_is_unknown() {
+        let mut render = PullRender::new(false);
+        render.update(&detail("a1b2", "Downloading", 2_500, None));
+        assert_eq!(render.lines["a1b2"], "a1b2: Downloading 2.5kB");
+    }
+
+    #[test]
+    fn a_bar_is_never_printed_line_by_line_without_a_terminal() {
+        let mut render = PullRender::new(false);
+        for current in [1_000, 2_000, 3_000] {
+            render.update(&detail("a1b2", "Downloading", current, Some(4_000)));
+        }
+        assert!(
+            render.lines["a1b2"].contains("3.0kB/4.0kB"),
+            "de regel volgt de voortgang ook zonder terminal"
         );
     }
 
