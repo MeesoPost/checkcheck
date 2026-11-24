@@ -14,6 +14,12 @@ const MANIFEST_ACCEPT: &str = "application/vnd.docker.distribution.manifest.list
 
 const DIGEST_HEADER: &str = "docker-content-digest";
 
+/// Extra attempts for a 5xx. Registries that front a CDN (lscr.io in
+/// particular) hand these out in bursts while they recover, and the next
+/// attempt a moment later usually lands.
+const TRANSIENT_RETRIES: u32 = 2;
+const RETRY_BACKOFF: Duration = Duration::from_millis(400);
+
 #[derive(Debug, Clone)]
 pub struct ImageRef {
     pub host: String,
@@ -128,7 +134,7 @@ impl RegistryClient {
         );
 
         let resp = self
-            .send(Method::HEAD, &url, MANIFEST_ACCEPT, image)
+            .send_retrying(Method::HEAD, &url, MANIFEST_ACCEPT, image)
             .await?;
         let status = resp.status();
         match status {
@@ -144,6 +150,8 @@ impl RegistryClient {
             if let Some(digest) = digest_header(&resp) {
                 return Ok(digest);
             }
+        } else if status.is_server_error() {
+            bail!("registry is unavailable (HTTP {status}, still failing after retries)");
         } else if status != StatusCode::METHOD_NOT_ALLOWED {
             bail!("registry returned HTTP {status}");
         }
@@ -152,7 +160,9 @@ impl RegistryClient {
     }
 
     async fn digest_via_get(&self, url: &str, image: &ImageRef) -> Result<String> {
-        let resp = self.send(Method::GET, url, MANIFEST_ACCEPT, image).await?;
+        let resp = self
+            .send_retrying(Method::GET, url, MANIFEST_ACCEPT, image)
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             bail!("registry returned HTTP {status}");
@@ -216,13 +226,34 @@ impl RegistryClient {
             "https://{}/v2/{}/{kind}/{reference}",
             image.host, image.repository
         );
-        let resp = self.send(Method::GET, &url, accept, image).await?;
+        let resp = self.send_retrying(Method::GET, &url, accept, image).await?;
         if !resp.status().is_success() {
             bail!("registry returned HTTP {}", resp.status());
         }
         resp.json()
             .await
             .context("could not parse the registry response as JSON")
+    }
+
+    /// `send`, but a 5xx is retried a couple of times with a short pause. Only
+    /// the status is retried, never a transport failure: a timeout has already
+    /// cost the full timeout window, and repeating it would undo the point of
+    /// checking images concurrently.
+    async fn send_retrying(
+        &self,
+        method: Method,
+        url: &str,
+        accept: &str,
+        image: &ImageRef,
+    ) -> Result<Response> {
+        for attempt in 0..=TRANSIENT_RETRIES {
+            let resp = self.send(method.clone(), url, accept, image).await?;
+            if !resp.status().is_server_error() || attempt == TRANSIENT_RETRIES {
+                return Ok(resp);
+            }
+            tokio::time::sleep(RETRY_BACKOFF * (attempt + 1)).await;
+        }
+        unreachable!("loop returns on its last iteration")
     }
 
     async fn send(

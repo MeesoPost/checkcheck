@@ -640,7 +640,7 @@ mod bench {
         "debian:12-slim",
         "python:3.12-slim",
         "node:20-alpine",
-        "lscr.io/linuxserver/sonarr:latest",
+        "memcached:alpine",
         "ghcr.io/paperless-ngx/paperless-ngx:latest",
     ];
 
@@ -658,23 +658,40 @@ mod bench {
         (started.elapsed(), results.iter().filter(|ok| **ok).count())
     }
 
+    /// Best of two, because a single slow response from any host otherwise
+    /// decides the number and the sweep stops being readable.
+    async fn best_of_two(limit: usize, refs: &[ImageRef]) -> (std::time::Duration, usize) {
+        let first = time_pass(limit, refs).await;
+        let second = time_pass(limit, refs).await;
+        if first.0 <= second.0 {
+            first
+        } else {
+            second
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn concurrency_sweep() {
         let refs: Vec<ImageRef> = IMAGES.iter().map(|i| registry::parse(i).unwrap()).collect();
 
-        let (baseline, ok) = time_pass(1, &refs).await;
+        let (baseline, ok) = best_of_two(1, &refs).await;
         println!("concurrency  1: {baseline:>9.2?}  ({ok}/{} ok)", refs.len());
 
         for limit in [4usize, 8, 16] {
-            let (elapsed, ok) = time_pass(limit, &refs).await;
+            let (elapsed, ok) = best_of_two(limit, &refs).await;
             println!(
                 "concurrency {limit:>2}: {elapsed:>9.2?}  ({ok}/{} ok)  {:.1}x",
                 refs.len(),
                 baseline.as_secs_f64() / elapsed.as_secs_f64()
             );
         }
-        println!("\nA registry that is down shows up as a failure, not as lost time:");
-        println!("one slow or broken host overlaps with the rest instead of adding to the total.");
+        println!();
+        println!(
+            "Fewer than {}/{} ok means a registry was unwell, and that run's",
+            refs.len(),
+            refs.len()
+        );
+        println!("timing says more about that host than about the concurrency level.");
     }
 }

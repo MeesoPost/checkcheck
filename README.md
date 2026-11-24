@@ -113,6 +113,10 @@ Gemeten over 12 images, waarvan één op een registry die 502 gaf:
 | 8 (standaard) | ~1,1 s |
 | 16 | ~0,8 s |
 
+Een 5xx wordt twee keer opnieuw geprobeerd met een korte pauze; registries die
+achter een CDN zitten geven die in vlagen af. Blijft hij falen, dan staat er
+`registry is unavailable` en is de registry zelf aan de beurt, niet checkcheck.
+
 Hoger kan sneller zijn, maar vergroot de kans op een HTTP 429 van de registry.
 Krijg je die, zet `--concurrency` dan lager. Het juiste getal hangt af van de
 latency van de machine naar de registries die je gebruikt; meet het met:
