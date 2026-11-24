@@ -3,6 +3,7 @@ mod registry;
 
 use anyhow::Result;
 use clap::Parser;
+use futures_util::stream::{self, StreamExt};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
@@ -21,6 +22,10 @@ struct Cli {
     /// Seconds between the first and the confirmation pass (0 skips confirmation)
     #[arg(long, default_value_t = 5, value_name = "SECONDS")]
     delay: u64,
+
+    /// Registry requests to keep in flight at once (lower this on HTTP 429)
+    #[arg(long, default_value_t = 8, value_name = "N")]
+    concurrency: usize,
 
     /// HTTP timeout per registry request
     #[arg(long, default_value_t = 15, value_name = "SECONDS")]
@@ -131,19 +136,30 @@ async fn run() -> Result<()> {
         to_check
     );
 
-    let mut client = RegistryClient::new(cli.timeout)?;
+    let client = RegistryClient::new(cli.timeout)?;
 
-    for check in checks.iter_mut() {
-        if !matches!(check.status, Status::Pending) {
-            continue;
-        }
-        let Some(parsed) = &check.parsed else {
-            continue;
-        };
-        let result = client.manifest_digest(parsed).await;
+    let limit = cli.concurrency.max(1);
+
+    let jobs: Vec<(usize, ImageRef)> = checks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c.status, Status::Pending))
+        .filter_map(|(i, c)| c.parsed.clone().map(|parsed| (i, parsed)))
+        .collect();
+
+    let results: Vec<(usize, Result<String>)> = stream::iter(jobs)
+        .map(|(i, parsed)| {
+            let client = &client;
+            async move { (i, client.manifest_digest(&parsed).await) }
+        })
+        .buffer_unordered(limit)
+        .collect()
+        .await;
+
+    for (i, result) in results {
         match result {
-            Ok(remote) => check.first_remote = Some(remote),
-            Err(err) => check.status = Status::Error(format!("{err:#}")),
+            Ok(remote) => checks[i].first_remote = Some(remote),
+            Err(err) => checks[i].status = Status::Error(format!("{err:#}")),
         }
     }
 
@@ -163,45 +179,88 @@ async fn run() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(cli.delay)).await;
     }
 
-    for i in read_once {
-        let (Some(first), Some(local)) = (
-            checks[i].first_remote.clone(),
-            checks[i].local_digest.clone(),
-        ) else {
-            continue;
-        };
-
-        if cli.delay == 0 {
+    if cli.delay == 0 {
+        for i in read_once {
+            let (Some(first), Some(local)) = (
+                checks[i].first_remote.clone(),
+                checks[i].local_digest.clone(),
+            ) else {
+                continue;
+            };
             checks[i].status = if first == local {
                 Status::UpToDate
             } else {
                 Status::UpdateAvailable { remote: first }
             };
-            continue;
         }
+    } else {
+        let jobs: Vec<(usize, ImageRef, String, String)> = read_once
+            .into_iter()
+            .filter_map(|i| {
+                let check = &checks[i];
+                Some((
+                    i,
+                    check.parsed.clone()?,
+                    check.first_remote.clone()?,
+                    check.local_digest.clone()?,
+                ))
+            })
+            .collect();
 
-        let Some(parsed) = &checks[i].parsed else {
-            continue;
-        };
-        let result = client.manifest_digest(parsed).await;
-        checks[i].status = match result {
-            Ok(second) if first == local && second == local => Status::UpToDate,
-            Ok(second) if first != local && second == first => {
-                Status::UpdateAvailable { remote: first }
-            }
-            Ok(_) => Status::Unstable,
-            Err(err) => Status::Error(format!("confirmation pass failed: {err:#}")),
-        };
+        let results: Vec<(usize, String, String, Result<String>)> = stream::iter(jobs)
+            .map(|(i, parsed, first, local)| {
+                let client = &client;
+                async move { (i, first, local, client.manifest_digest(&parsed).await) }
+            })
+            .buffer_unordered(limit)
+            .collect()
+            .await;
+
+        for (i, first, local, result) in results {
+            checks[i].status = match result {
+                Ok(second) if first == local && second == local => Status::UpToDate,
+                Ok(second) if first != local && second == first => {
+                    Status::UpdateAvailable { remote: first }
+                }
+                Ok(_) => Status::Unstable,
+                Err(err) => Status::Error(format!("confirmation pass failed: {err:#}")),
+            };
+        }
     }
 
-    for check in checks.iter_mut() {
-        let (Status::UpdateAvailable { remote }, Some(parsed)) = (&check.status, &check.parsed)
-        else {
-            continue;
-        };
-        check.remote_created = client
-            .manifest_created(parsed, remote, &check.os, &check.architecture)
-            .await;
+    let jobs: Vec<(usize, ImageRef, String, String, String)> = checks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, check)| {
+            let Status::UpdateAvailable { remote } = &check.status else {
+                return None;
+            };
+            Some((
+                i,
+                check.parsed.clone()?,
+                remote.clone(),
+                check.os.clone(),
+                check.architecture.clone(),
+            ))
+        })
+        .collect();
+
+    let results: Vec<(usize, Option<String>)> = stream::iter(jobs)
+        .map(|(i, parsed, remote, os, arch)| {
+            let client = &client;
+            async move {
+                (
+                    i,
+                    client.manifest_created(&parsed, &remote, &os, &arch).await,
+                )
+            }
+        })
+        .buffer_unordered(limit)
+        .collect()
+        .await;
+
+    for (i, created) in results {
+        checks[i].remote_created = created;
     }
 
     if cli.pull {
@@ -557,5 +616,65 @@ mod tests {
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
         let y = yoe + era * 400 + i64::from(m <= 2);
         format!("{y:04}-{m:02}-{d:02}T00:00:00Z")
+    }
+}
+
+/// Not a unit test: a stopwatch for picking `--concurrency` on a given host,
+/// since the right value depends on that machine's latency to the registries it
+/// actually uses. Hits the network, so it only runs when asked for by name:
+///
+///     cargo test --release bench -- --ignored --nocapture
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    const IMAGES: &[&str] = &[
+        "nginx:latest",
+        "redis:latest",
+        "alpine:latest",
+        "postgres:16",
+        "mariadb:11",
+        "traefik:v3.1",
+        "busybox:latest",
+        "debian:12-slim",
+        "python:3.12-slim",
+        "node:20-alpine",
+        "lscr.io/linuxserver/sonarr:latest",
+        "ghcr.io/paperless-ngx/paperless-ngx:latest",
+    ];
+
+    async fn time_pass(limit: usize, refs: &[ImageRef]) -> (std::time::Duration, usize) {
+        let client = RegistryClient::new(20).unwrap();
+        let started = Instant::now();
+        let results: Vec<bool> = stream::iter(refs.to_vec())
+            .map(|parsed| {
+                let client = &client;
+                async move { client.manifest_digest(&parsed).await.is_ok() }
+            })
+            .buffer_unordered(limit)
+            .collect()
+            .await;
+        (started.elapsed(), results.iter().filter(|ok| **ok).count())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn concurrency_sweep() {
+        let refs: Vec<ImageRef> = IMAGES.iter().map(|i| registry::parse(i).unwrap()).collect();
+
+        let (baseline, ok) = time_pass(1, &refs).await;
+        println!("concurrency  1: {baseline:>9.2?}  ({ok}/{} ok)", refs.len());
+
+        for limit in [4usize, 8, 16] {
+            let (elapsed, ok) = time_pass(limit, &refs).await;
+            println!(
+                "concurrency {limit:>2}: {elapsed:>9.2?}  ({ok}/{} ok)  {:.1}x",
+                refs.len(),
+                baseline.as_secs_f64() / elapsed.as_secs_f64()
+            );
+        }
+        println!("\nA registry that is down shows up as a failure, not as lost time:");
+        println!("one slow or broken host overlaps with the rest instead of adding to the total.");
     }
 }

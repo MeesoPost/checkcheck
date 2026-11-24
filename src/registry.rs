@@ -4,6 +4,7 @@ use reqwest::{Client, Method, Response, StatusCode};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 const MANIFEST_ACCEPT: &str = "application/vnd.docker.distribution.manifest.list.v2+json, \
@@ -95,9 +96,15 @@ fn normalize_name(name: &str) -> &str {
     name.strip_prefix("library/").unwrap_or(name)
 }
 
+struct AuthEndpoint {
+    realm: String,
+    service: Option<String>,
+}
+
 pub struct RegistryClient {
     http: Client,
-    tokens: HashMap<String, String>,
+    tokens: Mutex<HashMap<String, String>>,
+    endpoints: Mutex<HashMap<String, AuthEndpoint>>,
 }
 
 impl RegistryClient {
@@ -109,11 +116,12 @@ impl RegistryClient {
             .context("could not build the HTTP client")?;
         Ok(Self {
             http,
-            tokens: HashMap::new(),
+            tokens: Mutex::new(HashMap::new()),
+            endpoints: Mutex::new(HashMap::new()),
         })
     }
 
-    pub async fn manifest_digest(&mut self, image: &ImageRef) -> Result<String> {
+    pub async fn manifest_digest(&self, image: &ImageRef) -> Result<String> {
         let url = format!(
             "https://{}/v2/{}/manifests/{}",
             image.host, image.repository, image.tag
@@ -143,7 +151,7 @@ impl RegistryClient {
         self.digest_via_get(&url, image).await
     }
 
-    async fn digest_via_get(&mut self, url: &str, image: &ImageRef) -> Result<String> {
+    async fn digest_via_get(&self, url: &str, image: &ImageRef) -> Result<String> {
         let resp = self.send(Method::GET, url, MANIFEST_ACCEPT, image).await?;
         let status = resp.status();
         if !status.is_success() {
@@ -161,7 +169,7 @@ impl RegistryClient {
     }
 
     pub async fn manifest_created(
-        &mut self,
+        &self,
         image: &ImageRef,
         digest: &str,
         os: &str,
@@ -198,7 +206,7 @@ impl RegistryClient {
     }
 
     async fn get_json(
-        &mut self,
+        &self,
         image: &ImageRef,
         kind: &str,
         reference: &str,
@@ -218,17 +226,30 @@ impl RegistryClient {
     }
 
     async fn send(
-        &mut self,
+        &self,
         method: Method,
         url: &str,
         accept: &str,
         image: &ImageRef,
     ) -> Result<Response> {
         let key = format!("{}/{}", image.host, image.repository);
-        let cached = self.tokens.get(&key).cloned();
+        let mut token = self.cached_token(&key);
+
+        // A first request to an unseen repository is answered with a 401 that
+        // only names the token endpoint. Once another repository on the same
+        // host has told us where that is, the token can be fetched up front and
+        // that guaranteed round trip skipped.
+        if token.is_none() {
+            if let Some((realm, service)) = self.cached_endpoint(&image.host) {
+                if let Ok(fresh) = self.fetch_token(&realm, service.as_deref(), image).await {
+                    self.store_token(&key, &fresh);
+                    token = Some(fresh);
+                }
+            }
+        }
 
         let resp = self
-            .request(method.clone(), url, accept, cached.as_deref())
+            .request(method.clone(), url, accept, token.as_deref())
             .await?;
         if resp.status() != StatusCode::UNAUTHORIZED {
             return Ok(resp);
@@ -240,9 +261,45 @@ impl RegistryClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        let token = self.fetch_token(&challenge, image).await?;
-        self.tokens.insert(key, token.clone());
+        let params = parse_challenge(&challenge);
+        let realm = params
+            .get("realm")
+            .cloned()
+            .ok_or_else(|| anyhow!("registry did not offer a bearer token endpoint"))?;
+        let service = params.get("service").cloned();
+        self.store_endpoint(&image.host, &realm, service.as_deref());
+
+        let token = self.fetch_token(&realm, service.as_deref(), image).await?;
+        self.store_token(&key, &token);
         self.request(method, url, accept, Some(&token)).await
+    }
+
+    fn cached_token(&self, key: &str) -> Option<String> {
+        self.tokens.lock().ok()?.get(key).cloned()
+    }
+
+    fn store_token(&self, key: &str, token: &str) {
+        if let Ok(mut tokens) = self.tokens.lock() {
+            tokens.insert(key.to_string(), token.to_string());
+        }
+    }
+
+    fn cached_endpoint(&self, host: &str) -> Option<(String, Option<String>)> {
+        let endpoints = self.endpoints.lock().ok()?;
+        let endpoint = endpoints.get(host)?;
+        Some((endpoint.realm.clone(), endpoint.service.clone()))
+    }
+
+    fn store_endpoint(&self, host: &str, realm: &str, service: Option<&str>) {
+        if let Ok(mut endpoints) = self.endpoints.lock() {
+            endpoints.insert(
+                host.to_string(),
+                AuthEndpoint {
+                    realm: realm.to_string(),
+                    service: service.map(str::to_string),
+                },
+            );
+        }
     }
 
     async fn request(
@@ -261,19 +318,20 @@ impl RegistryClient {
             .with_context(|| format!("could not reach {url}"))
     }
 
-    async fn fetch_token(&self, challenge: &str, image: &ImageRef) -> Result<String> {
-        let params = parse_challenge(challenge);
-        let realm = params
-            .get("realm")
-            .ok_or_else(|| anyhow!("registry did not offer a bearer token endpoint"))?;
-        let scope = params
-            .get("scope")
-            .cloned()
-            .unwrap_or_else(|| format!("repository:{}:pull", image.repository));
+    // The scope is always built from this image rather than taken from the
+    // challenge: a cached endpoint is shared between repositories on a host, and
+    // a challenge's scope names whichever repository happened to trigger it.
+    async fn fetch_token(
+        &self,
+        realm: &str,
+        service: Option<&str>,
+        image: &ImageRef,
+    ) -> Result<String> {
+        let scope = format!("repository:{}:pull", image.repository);
 
         let mut req = self.http.get(realm).query(&[("scope", scope.as_str())]);
-        if let Some(service) = params.get("service") {
-            req = req.query(&[("service", service.as_str())]);
+        if let Some(service) = service {
+            req = req.query(&[("service", service)]);
         }
 
         let resp = req

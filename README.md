@@ -23,6 +23,7 @@ Geen root nodig, mits je gebruiker in de `docker` group zit.
 checkcheck                    # standaard: twee passes, 5 seconden ertussen
 checkcheck --pull             # pullen, daarna alleen de stacklijst
 checkcheck --delay 0          # snel, één pass
+checkcheck --concurrency 16   # meer registry-verzoeken tegelijk
 ```
 
 ```
@@ -97,6 +98,31 @@ een redeploy zelf.
 Er wordt geen container aangeraakt. Het nieuwe image staat daarna in de lokale
 store, de container draait door op het oude tot je de stack opnieuw uitrolt.
 Ruim oude images af en toe op met `docker image prune`.
+
+## Snelheid
+
+De registry-verzoeken gaan parallel, standaard 8 tegelijk. Dat scheelt niet
+alleen tijd, het maakt de looptijd ook ongevoelig voor één trage registry: die
+overlapt dan met de rest in plaats van bij het totaal op te tellen.
+
+Gemeten over 12 images, waarvan één op een registry die 502 gaf:
+
+| Tegelijk | Tijd |
+|---|---|
+| 1 (zoals voorheen) | 3,6 s – 16 s, afhankelijk van de traagste host |
+| 8 (standaard) | ~1,1 s |
+| 16 | ~0,8 s |
+
+Hoger kan sneller zijn, maar vergroot de kans op een HTTP 429 van de registry.
+Krijg je die, zet `--concurrency` dan lager. Het juiste getal hangt af van de
+latency van de machine naar de registries die je gebruikt; meet het met:
+
+```bash
+cargo test --release bench -- --ignored --nocapture
+```
+
+Wat overblijft is de vaste `--delay` tussen de twee passes. Dat is wachttijd,
+geen werk — met `--delay 0` vervalt hij, maar dan ook het ruisfilter.
 
 ## Beperkingen
 
