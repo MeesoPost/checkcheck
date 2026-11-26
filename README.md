@@ -65,11 +65,11 @@ laag, zoals `docker pull` hem toont:
 
 ```
 → lscr.io/linuxserver/tautulli:latest
-latest: Pulling from linuxserver/tautulli
-a1b2c3d4e5f6: Already exists
-b2c3d4e5f6a7: Downloading [=========>              ] 12.3MB/24.1MB
-c3d4e5f6a7b8: Download complete
-d4e5f6a7b8c9: Extracting [===============>        ] 41.2MB/52.7MB
+  latest: Pulling from linuxserver/tautulli
+  a1b2c3d4e5f6  ████████████████████  100%  exists
+  b2c3d4e5f6a7  ████████████░░░░░░░░   58%  22.1MB / 38.1MB   7.0MB/s
+  c3d4e5f6a7b8  ███░░░░░░░░░░░░░░░░░   14%  1.2MB / 8.7MB   2.1MB/s
+  d4e5f6a7b8c9  ░░░░░░░░░░░░░░░░░░░░    0%  waiting
 Digest: sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 Status: Downloaded newer image for lscr.io/linuxserver/tautulli:latest
 
@@ -80,12 +80,20 @@ Redeploy in Portainer:
 
 De daemon stuurt geen kant-en-klare balken mee, alleen het aantal gedownloade
 en te downloaden bytes per laag; de balk in `docker pull` wordt door de Docker
-CLI zelf getekend. Checkcheck doet hetzelfde: hij tekent de balk uit die
-getallen en herschrijft de regel van die laag ter plekke. Is het totaal
-onbekend, dan blijft het bij het aantal bytes, want een balk zonder noemer
-suggereert een voortgang die er niet is. Een image met veel lagen wordt
-afgekapt op twintig regels plus een samenvatting, zodat het blok in een normale
-terminal past.
+CLI zelf getekend. Checkcheck tekent zijn eigen balk uit die getallen en
+herschrijft de regel van die laag ter plekke. De snelheid is een lopend
+gemiddelde, zodat één trage seconde het getal niet laat schieten.
+
+De kleur zegt wat er gebeurt: gedimd betekent dat de laag nog wacht, cyaan dat
+er bytes bewegen, groen dat ze binnen zijn. Met `--no-color` of de
+omgevingsvariabele `NO_COLOR` blijft het bij blokken zonder kleur.
+
+Is het totaal onbekend, dan staat er een streepje in plaats van een percentage
+en alleen het aantal binnengehaalde bytes — een balk zonder noemer suggereert
+een voortgang die je niet kent. Een laag die klaar is staat altijd vol, ook als
+de laatste getallen van de daemon over het uitpakken gingen. Een image met veel
+lagen wordt afgekapt op twintig regels plus een samenvatting, zodat het blok in
+een normale terminal past.
 
 Zonder terminal — in een pipe, een cronjob of een logbestand — werkt dat
 herschrijven niet, want het gebruikt cursorcodes. Daar krijg je één regel per

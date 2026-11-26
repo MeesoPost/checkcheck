@@ -264,7 +264,7 @@ async fn run() -> Result<()> {
     }
 
     if cli.pull {
-        pull_updates(&docker, &checks).await;
+        pull_updates(&docker, &checks, cli.no_color).await;
     } else {
         print_report(&containers, &index, &checks, color);
     }
@@ -280,10 +280,12 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn pull_updates(docker: &bollard::Docker, checks: &[Check]) {
+async fn pull_updates(docker: &bollard::Docker, checks: &[Check], no_color: bool) {
     // Het laag-voor-laag blok herschrijft regels met cursorcodes; dat kan
-    // alleen op een echte terminal.
+    // alleen op een echte terminal. Kleur volgt dezelfde stroom, want het blok
+    // gaat naar stderr en het rapport naar stdout.
     let tty = std::io::stderr().is_terminal();
+    let color = tty && !no_color && std::env::var_os("NO_COLOR").is_none();
     let mut seen: HashSet<String> = HashSet::new();
 
     for check in checks {
@@ -300,7 +302,9 @@ async fn pull_updates(docker: &bollard::Docker, checks: &[Check]) {
         }
 
         eprintln!("\n→ {reference}");
-        if let Err(err) = docker::pull_image(docker, &parsed.name_no_tag, &parsed.tag, tty).await {
+        if let Err(err) =
+            docker::pull_image(docker, &parsed.name_no_tag, &parsed.tag, tty, color).await
+        {
             eprintln!("failed: {err:#}");
         }
     }

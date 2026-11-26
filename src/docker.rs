@@ -1,11 +1,12 @@
 use anyhow::{bail, Context, Result};
 use bollard::container::ListContainersOptions;
 use bollard::image::CreateImageOptions;
-use bollard::models::{ContainerSummary, CreateImageInfo, ProgressDetail};
+use bollard::models::{ContainerSummary, CreateImageInfo};
 use bollard::{Docker, API_DEFAULT_VERSION};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 /// Label Docker Compose puts on every container it creates; its value is the
 /// stack name Portainer shows.
@@ -174,8 +175,16 @@ async fn image_meta(docker: &Docker, image_id: &str) -> ImageMeta {
 /// image met veel lagen door zichzelf heen gaan lopen.
 const MAX_LAYER_LINES: usize = 20;
 
-/// Breedte van de voortgangsbalk in tekens.
-const BAR_WIDTH: usize = 24;
+/// Breedte van de balk in tekens.
+const BAR_WIDTH: usize = 20;
+
+/// Hoe zwaar een verse snelheidsmeting meeweegt. Laag houdt het getal rustig,
+/// zodat één trage seconde het niet laat schieten.
+const SPEED_SMOOTHING: f64 = 0.3;
+
+/// Kortste tijd tussen twee snelheidsmetingen. De daemon stuurt vaker dan dat,
+/// en delen door een paar milliseconden levert onzin op.
+const SPEED_INTERVAL: Duration = Duration::from_millis(250);
 
 fn human_bytes(bytes: i64) -> String {
     const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
@@ -193,101 +202,230 @@ fn human_bytes(bytes: i64) -> String {
     }
 }
 
-/// Tekent de balk die de daemon zelf niet meestuurt: die geeft alleen
-/// `progressDetail`, en de balk in `docker pull` wordt door de CLI gemaakt.
-/// Zonder bekend totaal blijft het bij het aantal bytes, want een balk zonder
-/// noemer suggereert een voortgang die er niet is.
-fn progress_bar(detail: Option<&ProgressDetail>) -> Option<String> {
-    let detail = detail?;
-    let current = detail.current?;
-
-    let Some(total) = detail.total.filter(|total| *total > 0) else {
-        return (current > 0).then(|| human_bytes(current));
-    };
-
-    let done = current.clamp(0, total) as f64 / total as f64;
-    let filled = (done * BAR_WIDTH as f64).round() as usize;
-
-    let mut bar = String::with_capacity(BAR_WIDTH + 2);
-    bar.push('[');
-    for slot in 1..=BAR_WIDTH {
-        bar.push(
-            if slot < filled || (slot == filled && filled == BAR_WIDTH) {
-                '='
-            } else if slot == filled {
-                '>'
-            } else {
-                ' '
-            },
-        );
-    }
-    bar.push(']');
-
-    Some(format!(
-        "{bar} {}/{}",
-        human_bytes(current),
-        human_bytes(total)
-    ))
+fn bar(filled: f64) -> String {
+    let blocks = (filled.clamp(0.0, 1.0) * BAR_WIDTH as f64).round() as usize;
+    let mut out = String::with_capacity(BAR_WIDTH * 3);
+    out.push_str(&"█".repeat(blocks));
+    out.push_str(&"░".repeat(BAR_WIDTH - blocks));
+    out
 }
 
-/// Bouwt de weergave van `docker pull` na: één regel per laag, die ter plekke
-/// wordt herschreven terwijl de daemon voortgang stuurt. Zonder TTY kan dat
-/// niet, en valt het terug op één regel per statuswijziging — de
-/// voortgangsbalken worden dan overgeslagen.
+/// Wat een laag op dit moment doet. De daemon beschrijft dat in losse
+/// zinnetjes; alleen de gevallen die de weergave anders maken staan hier.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Waiting,
+    Downloading,
+    Verifying,
+    Downloaded,
+    Extracting,
+    Done,
+    Cached,
+    /// Een melding die niet over een laag gaat, zoals de regel waarmee de
+    /// daemon aankondigt uit welke repository hij pullt.
+    Other,
+}
+
+impl Phase {
+    fn of(status: &str) -> Self {
+        match status {
+            "Pulling fs layer" | "Waiting" | "Retrying" => Phase::Waiting,
+            "Downloading" => Phase::Downloading,
+            "Verifying Checksum" => Phase::Verifying,
+            "Download complete" => Phase::Downloaded,
+            "Extracting" => Phase::Extracting,
+            "Pull complete" => Phase::Done,
+            "Already exists" => Phase::Cached,
+            _ => Phase::Other,
+        }
+    }
+
+    /// Hoe vol de balk staat zonder getallen van de daemon. Een laag die klaar
+    /// is weet je vol, een laag die wacht weet je leeg; de rest niet.
+    fn implied(self) -> Option<f64> {
+        match self {
+            Phase::Waiting => Some(0.0),
+            Phase::Verifying | Phase::Downloaded | Phase::Done | Phase::Cached => Some(1.0),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Phase::Waiting => "waiting",
+            Phase::Verifying => "verifying",
+            Phase::Downloaded => "downloaded",
+            Phase::Extracting => "extracting",
+            Phase::Done => "done",
+            Phase::Cached => "exists",
+            Phase::Downloading | Phase::Other => "",
+        }
+    }
+
+    /// Gedimd zolang er niets gebeurt, cyaan terwijl er bytes bewegen, groen
+    /// zodra ze binnen zijn.
+    fn color(self) -> &'static str {
+        match self {
+            Phase::Downloading | Phase::Extracting => "36",
+            Phase::Verifying | Phase::Downloaded | Phase::Done | Phase::Cached => "32",
+            Phase::Waiting | Phase::Other => "2",
+        }
+    }
+}
+
+#[derive(Default)]
+struct Layer {
+    phase: Phase,
+    status: String,
+    current: i64,
+    total: i64,
+    speed: Option<f64>,
+    sample: Option<(Instant, i64)>,
+}
+
+impl Layer {
+    /// Schat de snelheid uit het verschil met de vorige meting.
+    fn observe(&mut self, now: Instant) {
+        let Some((taken, bytes)) = self.sample else {
+            self.sample = Some((now, self.current));
+            return;
+        };
+
+        let elapsed = now.saturating_duration_since(taken);
+        if elapsed < SPEED_INTERVAL {
+            return;
+        }
+
+        let rate = (self.current - bytes).max(0) as f64 / elapsed.as_secs_f64();
+        self.speed = Some(match self.speed {
+            Some(previous) => previous + (rate - previous) * SPEED_SMOOTHING,
+            None => rate,
+        });
+        self.sample = Some((now, self.current));
+    }
+
+    /// Een fase die zichzelf verraadt gaat voor op de getallen: de laatste
+    /// cijfers van de daemon gaan over het uitpakken en stoppen halverwege,
+    /// terwijl de laag wel degelijk klaar is.
+    fn filled(&self) -> Option<f64> {
+        self.phase.implied().or_else(|| {
+            (self.total > 0).then(|| self.current.clamp(0, self.total) as f64 / self.total as f64)
+        })
+    }
+
+    fn detail(&self) -> String {
+        match self.phase {
+            Phase::Downloading | Phase::Extracting if self.total > 0 => {
+                let trailing = match (self.phase, self.speed) {
+                    (Phase::Downloading, Some(speed)) => {
+                        format!("   {}/s", human_bytes(speed as i64))
+                    }
+                    _ => format!("   {}", self.phase.label()),
+                };
+                format!(
+                    "{} / {}{}",
+                    human_bytes(self.current),
+                    human_bytes(self.total),
+                    trailing.trim_end()
+                )
+            }
+            Phase::Downloading | Phase::Extracting => human_bytes(self.current),
+            Phase::Downloaded | Phase::Done if self.total > 0 => {
+                format!("{}   {}", human_bytes(self.total), self.phase.label())
+            }
+            _ => self.phase.label().to_string(),
+        }
+    }
+
+    fn render(&self, id: &str, color: bool) -> String {
+        if self.phase == Phase::Other {
+            return format!("  {id}: {}", self.status);
+        }
+
+        let filled = self.filled();
+        let percentage = match filled {
+            Some(filled) => format!("{}%", (filled * 100.0).round()),
+            None => "—".to_string(),
+        };
+
+        let line = format!(
+            "  {id:<12}  {}  {percentage:>4}  {}",
+            paint(color, self.phase.color(), &bar(filled.unwrap_or(0.0))),
+            self.detail()
+        );
+        line.trim_end().to_string()
+    }
+}
+
+fn paint(color: bool, code: &str, text: &str) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Toont de pull laag voor laag en herschrijft elke regel ter plekke terwijl de
+/// daemon voortgang stuurt. Zonder TTY kan dat niet, en valt het terug op één
+/// regel per statuswijziging.
 struct PullRender {
     tty: bool,
+    color: bool,
     order: Vec<String>,
-    lines: HashMap<String, String>,
+    layers: HashMap<String, Layer>,
     drawn: usize,
 }
 
 impl PullRender {
-    fn new(tty: bool) -> Self {
+    fn new(tty: bool, color: bool) -> Self {
         Self {
             tty,
+            color,
             order: Vec::new(),
-            lines: HashMap::new(),
+            layers: HashMap::new(),
             drawn: 0,
         }
     }
 
     fn update(&mut self, info: &CreateImageInfo) {
-        let Some(status) = info.status.as_deref().filter(|s| !s.is_empty()) else {
+        let Some(status) = info.status.as_deref().filter(|status| !status.is_empty()) else {
             return;
         };
 
-        match info.id.as_deref().filter(|id| !id.is_empty()) {
-            Some(id) => {
-                let bar = info
-                    .progress
-                    .as_deref()
-                    .filter(|progress| !progress.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| progress_bar(info.progress_detail.as_ref()));
+        // Geen id: een bericht over het image als geheel, zoals
+        // "Digest: sha256:…" of "Status: Downloaded newer image for …".
+        let Some(id) = info.id.as_deref().filter(|id| !id.is_empty()) else {
+            self.drawn = 0;
+            eprintln!("{status}");
+            return;
+        };
 
-                let line = match &bar {
-                    Some(bar) => format!("{id}: {status} {bar}"),
-                    None => format!("{id}: {status}"),
-                };
+        if !self.layers.contains_key(id) {
+            self.order.push(id.to_string());
+        }
 
-                if !self.lines.contains_key(id) {
-                    self.order.push(id.to_string());
-                }
-                let previous = self.lines.insert(id.to_string(), line.clone());
-                let changed = previous.as_deref() != Some(line.as_str());
+        let layer = self.layers.entry(id.to_string()).or_default();
+        let changed = layer.status != status;
 
-                if self.tty {
-                    self.redraw();
-                } else if changed && bar.is_none() {
-                    eprintln!("{line}");
-                }
-            }
-            // Geen id: een bericht over het image als geheel, zoals
-            // "Digest: sha256:…" of "Status: Downloaded newer image for …".
-            None => {
-                self.drawn = 0;
-                eprintln!("{status}");
-            }
+        layer.phase = Phase::of(status);
+        layer.status = status.to_string();
+        if let Some(detail) = &info.progress_detail {
+            layer.current = detail.current.unwrap_or(layer.current);
+            layer.total = detail.total.unwrap_or(layer.total);
+        }
+
+        if layer.phase == Phase::Downloading {
+            layer.observe(Instant::now());
+        } else {
+            layer.speed = None;
+            layer.sample = None;
+        }
+
+        if self.tty {
+            self.redraw();
+        } else if changed {
+            eprintln!("{id}: {status}");
         }
     }
 
@@ -301,11 +439,13 @@ impl PullRender {
         }
         for id in &self.order[..shown] {
             out.push_str("\r\x1b[2K");
-            out.push_str(self.lines.get(id).map(String::as_str).unwrap_or(""));
+            if let Some(layer) = self.layers.get(id) {
+                out.push_str(&layer.render(id, self.color));
+            }
             out.push('\n');
         }
         if hidden > 0 {
-            out.push_str(&format!("\r\x1b[2K… and {hidden} more layer(s)\n"));
+            out.push_str(&format!("\r\x1b[2K  … and {hidden} more layer(s)\n"));
         }
 
         self.drawn = shown + usize::from(hidden > 0);
@@ -315,14 +455,20 @@ impl PullRender {
     }
 }
 
-pub async fn pull_image(docker: &Docker, repository: &str, tag: &str, tty: bool) -> Result<()> {
+pub async fn pull_image(
+    docker: &Docker,
+    repository: &str,
+    tag: &str,
+    tty: bool,
+    color: bool,
+) -> Result<()> {
     let options = CreateImageOptions {
         from_image: repository,
         tag,
         ..Default::default()
     };
 
-    let mut render = PullRender::new(tty);
+    let mut render = PullRender::new(tty, color);
     let mut stream = docker.create_image(Some(options), None, None);
 
     while let Some(item) = stream.next().await {
@@ -338,67 +484,146 @@ pub async fn pull_image(docker: &Docker, repository: &str, tag: &str, tty: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bollard::models::ProgressDetail;
 
-    fn info(id: Option<&str>, status: &str, progress: Option<&str>) -> CreateImageInfo {
+    fn plain(id: &str, status: &str) -> CreateImageInfo {
         CreateImageInfo {
-            id: id.map(str::to_string),
+            id: Some(id.to_string()),
             status: Some(status.to_string()),
-            progress: progress.map(str::to_string),
             ..Default::default()
         }
     }
 
-    #[test]
-    fn builds_one_line_per_layer_in_arrival_order() {
-        let mut render = PullRender::new(false);
-        render.update(&info(
-            Some("latest"),
-            "Pulling from linuxserver/tautulli",
-            None,
-        ));
-        render.update(&info(Some("a1b2"), "Pulling fs layer", None));
-        render.update(&info(Some("c3d4"), "Pulling fs layer", None));
-        render.update(&info(
-            Some("a1b2"),
-            "Downloading",
-            Some("[===>  ]  1.2MB/4.5MB"),
-        ));
-        render.update(&info(Some("a1b2"), "Pull complete", None));
+    fn sized(id: &str, status: &str, current: i64, total: Option<i64>) -> CreateImageInfo {
+        CreateImageInfo {
+            progress_detail: Some(ProgressDetail {
+                current: Some(current),
+                total,
+            }),
+            ..plain(id, status)
+        }
+    }
 
-        assert_eq!(
-            render.order,
-            vec!["latest", "a1b2", "c3d4"],
-            "volgorde van binnenkomst, elke laag precies één regel"
-        );
-        assert_eq!(render.lines["a1b2"], "a1b2: Pull complete");
-        assert_eq!(render.lines["c3d4"], "c3d4: Pulling fs layer");
+    fn line(render: &PullRender, id: &str) -> String {
+        render.layers[id].render(id, false)
     }
 
     #[test]
-    fn folds_the_progress_bar_into_the_layer_line() {
-        let mut render = PullRender::new(false);
-        render.update(&info(
-            Some("a1b2"),
+    fn keeps_one_line_per_layer_in_arrival_order() {
+        let mut render = PullRender::new(false, false);
+        render.update(&plain("latest", "Pulling from linuxserver/tautulli"));
+        render.update(&plain("a1b2", "Pulling fs layer"));
+        render.update(&plain("c3d4", "Pulling fs layer"));
+        render.update(&sized("a1b2", "Downloading", 1_200_000, Some(4_500_000)));
+        render.update(&plain("a1b2", "Pull complete"));
+
+        assert_eq!(render.order, vec!["latest", "a1b2", "c3d4"]);
+    }
+
+    #[test]
+    fn draws_a_block_bar_with_percentage_and_bytes() {
+        let mut render = PullRender::new(false, false);
+        render.update(&sized(
+            "b2c3d4e5",
             "Downloading",
-            Some("[==>   ]  1.2MB/4.5MB"),
+            22_100_000,
+            Some(38_100_000),
         ));
         assert_eq!(
-            render.lines["a1b2"],
-            "a1b2: Downloading [==>   ]  1.2MB/4.5MB"
+            line(&render, "b2c3d4e5"),
+            "  b2c3d4e5      ████████████░░░░░░░░   58%  22.1MB / 38.1MB"
         );
+    }
+
+    #[test]
+    fn a_finished_layer_is_full_and_labelled() {
+        let mut render = PullRender::new(false, false);
+        render.update(&sized(
+            "a1b2c3d4",
+            "Downloading",
+            4_100_000,
+            Some(4_100_000),
+        ));
+        render.update(&plain("a1b2c3d4", "Pull complete"));
+        assert_eq!(
+            line(&render, "a1b2c3d4"),
+            "  a1b2c3d4      ████████████████████  100%  4.1MB   done"
+        );
+    }
+
+    #[test]
+    fn a_completed_layer_is_full_despite_stale_extract_numbers() {
+        let mut render = PullRender::new(false, false);
+        render.update(&sized("a1b2", "Downloading", 38_100_000, Some(38_100_000)));
+        render.update(&sized("a1b2", "Extracting", 1, Some(38_100_000)));
+        render.update(&plain("a1b2", "Pull complete"));
+        assert_eq!(
+            line(&render, "a1b2"),
+            "  a1b2          ████████████████████  100%  38.1MB   done"
+        );
+    }
+
+    #[test]
+    fn a_layer_that_was_already_there_needs_no_numbers() {
+        let mut render = PullRender::new(false, false);
+        render.update(&plain("c3d4e5f6", "Already exists"));
+        assert_eq!(
+            line(&render, "c3d4e5f6"),
+            "  c3d4e5f6      ████████████████████  100%  exists"
+        );
+    }
+
+    #[test]
+    fn a_waiting_layer_shows_an_empty_bar() {
+        let mut render = PullRender::new(false, false);
+        render.update(&plain("d4e5f6a7", "Pulling fs layer"));
+        assert_eq!(
+            line(&render, "d4e5f6a7"),
+            "  d4e5f6a7      ░░░░░░░░░░░░░░░░░░░░    0%  waiting"
+        );
+    }
+
+    #[test]
+    fn an_unknown_total_leaves_the_percentage_blank() {
+        let mut render = PullRender::new(false, false);
+        render.update(&sized("e5f6a7b8", "Downloading", 2_500, None));
+        assert_eq!(
+            line(&render, "e5f6a7b8"),
+            "  e5f6a7b8      ░░░░░░░░░░░░░░░░░░░░     —  2.5kB"
+        );
+    }
+
+    #[test]
+    fn a_known_total_survives_an_update_without_one() {
+        let mut render = PullRender::new(false, false);
+        render.update(&sized("a1b2", "Downloading", 1_000, Some(4_000)));
+        render.update(&plain("a1b2", "Verifying Checksum"));
+        assert_eq!(
+            render.layers["a1b2"].total, 4_000,
+            "een statuswijziging zonder getallen mag het totaal niet wissen"
+        );
+    }
+
+    #[test]
+    fn progress_never_adds_a_second_line_for_the_same_layer() {
+        let mut render = PullRender::new(false, false);
+        for current in [1_000, 2_000, 3_000, 4_000] {
+            render.update(&sized("a1b2", "Downloading", current, Some(4_000)));
+        }
+        assert_eq!(render.order, vec!["a1b2"]);
+        assert!(line(&render, "a1b2").contains("100%"));
     }
 
     #[test]
     fn a_message_without_an_id_closes_the_block() {
-        let mut render = PullRender::new(true);
-        render.update(&info(Some("a1b2"), "Pull complete", None));
+        let mut render = PullRender::new(true, false);
+        render.update(&plain("a1b2", "Pull complete"));
         assert_eq!(render.drawn, 1);
 
-        render.update(&info(
-            None,
-            "Status: Downloaded newer image for x:latest",
-            None,
-        ));
+        render.update(&CreateImageInfo {
+            status: Some("Status: Downloaded newer image for x:latest".to_string()),
+            ..Default::default()
+        });
         assert_eq!(
             render.drawn, 0,
             "een volgend blok begint onder de al afgedrukte regels"
@@ -407,9 +632,9 @@ mod tests {
 
     #[test]
     fn caps_the_block_so_it_fits_a_terminal() {
-        let mut render = PullRender::new(true);
+        let mut render = PullRender::new(true, false);
         for i in 0..MAX_LAYER_LINES + 5 {
-            render.update(&info(Some(&format!("layer{i}")), "Pulling fs layer", None));
+            render.update(&plain(&format!("layer{i}"), "Pulling fs layer"));
         }
         assert_eq!(
             render.drawn,
@@ -418,61 +643,26 @@ mod tests {
         );
     }
 
-    fn detail(id: &str, status: &str, current: i64, total: Option<i64>) -> CreateImageInfo {
-        CreateImageInfo {
-            id: Some(id.to_string()),
-            status: Some(status.to_string()),
-            progress_detail: Some(ProgressDetail {
-                current: Some(current),
-                total,
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn draws_its_own_bar_when_the_daemon_only_sends_byte_counts() {
-        let mut render = PullRender::new(false);
-        render.update(&detail("a1b2", "Downloading", 1_048_576, Some(3_359_301)));
-        assert_eq!(
-            render.lines["a1b2"],
-            "a1b2: Downloading [======>                 ] 1.0MB/3.4MB"
-        );
-    }
-
-    #[test]
-    fn a_finished_layer_fills_the_whole_bar() {
-        let mut render = PullRender::new(false);
-        render.update(&detail("a1b2", "Downloading", 4_000, Some(4_000)));
-        assert_eq!(
-            render.lines["a1b2"],
-            "a1b2: Downloading [========================] 4.0kB/4.0kB"
-        );
-    }
-
-    #[test]
-    fn falls_back_to_bytes_when_the_total_is_unknown() {
-        let mut render = PullRender::new(false);
-        render.update(&detail("a1b2", "Downloading", 2_500, None));
-        assert_eq!(render.lines["a1b2"], "a1b2: Downloading 2.5kB");
-    }
-
-    #[test]
-    fn a_bar_is_never_printed_line_by_line_without_a_terminal() {
-        let mut render = PullRender::new(false);
-        for current in [1_000, 2_000, 3_000] {
-            render.update(&detail("a1b2", "Downloading", current, Some(4_000)));
-        }
-        assert!(
-            render.lines["a1b2"].contains("3.0kB/4.0kB"),
-            "de regel volgt de voortgang ook zonder terminal"
-        );
-    }
-
     #[test]
     fn ignores_an_empty_status() {
-        let mut render = PullRender::new(false);
-        render.update(&info(Some("a1b2"), "", None));
+        let mut render = PullRender::new(false, false);
+        render.update(&plain("a1b2", ""));
         assert!(render.order.is_empty());
+    }
+
+    #[test]
+    fn colour_wraps_only_the_bar() {
+        let mut render = PullRender::new(false, true);
+        render.update(&plain("a1b2", "Already exists"));
+        let rendered = render.layers["a1b2"].render("a1b2", true);
+        assert!(rendered.contains("\x1b[32m████"));
+        assert!(rendered.ends_with("\x1b[0m  100%  exists"));
+    }
+
+    #[test]
+    fn human_bytes_switches_unit_at_a_thousand() {
+        assert_eq!(human_bytes(999), "999B");
+        assert_eq!(human_bytes(1_000), "1.0kB");
+        assert_eq!(human_bytes(38_100_000), "38.1MB");
     }
 }
