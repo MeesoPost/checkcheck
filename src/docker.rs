@@ -175,8 +175,35 @@ async fn image_meta(docker: &Docker, image_id: &str) -> ImageMeta {
 /// image met veel lagen door zichzelf heen gaan lopen.
 const MAX_LAYER_LINES: usize = 20;
 
-/// Breedte van de balk in tekens.
-const BAR_WIDTH: usize = 20;
+/// Grenzen waarbinnen de balk met de terminal meeschaalt. Smaller dan het
+/// minimum zegt een balk niets meer; breder dan het maximum wordt hij alleen
+/// maar lang zonder meer te vertellen.
+const BAR_MIN: usize = 20;
+const BAR_MAX: usize = 60;
+
+/// Ruimte die de rest van de regel opeist: inspringing, laag-id, percentage,
+/// de tussenruimtes en het breedste getallenpaar met snelheid erachter.
+const LINE_RESERVED: usize = 52;
+
+/// Breedte als de terminal zich niet laat uitvragen.
+const FALLBACK_COLUMNS: usize = 80;
+
+/// Hoe breed de balk mag zijn. Een regel die breder is dan de terminal breekt
+/// af op een tweede regel, en dan klopt de cursor-rekensom van het blok niet
+/// meer en loopt het beeld door zichzelf heen.
+fn bar_width() -> usize {
+    let columns = terminal_size::terminal_size()
+        .map(|(terminal_size::Width(columns), _)| usize::from(columns))
+        .unwrap_or(FALLBACK_COLUMNS);
+
+    bar_width_for(columns)
+}
+
+fn bar_width_for(columns: usize) -> usize {
+    columns
+        .saturating_sub(LINE_RESERVED)
+        .clamp(BAR_MIN, BAR_MAX)
+}
 
 /// Hoe zwaar een verse snelheidsmeting meeweegt. Laag houdt het getal rustig,
 /// zodat één trage seconde het niet laat schieten.
@@ -202,11 +229,11 @@ fn human_bytes(bytes: i64) -> String {
     }
 }
 
-fn bar(filled: f64) -> String {
-    let blocks = (filled.clamp(0.0, 1.0) * BAR_WIDTH as f64).round() as usize;
-    let mut out = String::with_capacity(BAR_WIDTH * 3);
+fn bar(filled: f64, width: usize) -> String {
+    let blocks = (filled.clamp(0.0, 1.0) * width as f64).round() as usize;
+    let mut out = String::with_capacity(width * 3);
     out.push_str(&"█".repeat(blocks));
-    out.push_str(&"░".repeat(BAR_WIDTH - blocks));
+    out.push_str(&"░".repeat(width - blocks));
     out
 }
 
@@ -338,7 +365,7 @@ impl Layer {
         }
     }
 
-    fn render(&self, id: &str, color: bool) -> String {
+    fn render(&self, id: &str, color: bool, width: usize) -> String {
         if self.phase == Phase::Other {
             return format!("  {id}: {}", self.status);
         }
@@ -351,7 +378,11 @@ impl Layer {
 
         let line = format!(
             "  {id:<12}  {}  {percentage:>4}  {}",
-            paint(color, self.phase.color(), &bar(filled.unwrap_or(0.0))),
+            paint(
+                color,
+                self.phase.color(),
+                &bar(filled.unwrap_or(0.0), width)
+            ),
             self.detail()
         );
         line.trim_end().to_string()
@@ -372,6 +403,9 @@ fn paint(color: bool, code: &str, text: &str) -> String {
 struct PullRender {
     tty: bool,
     color: bool,
+    /// Eenmaal bepaald bij de start: een balk die tijdens de pull van breedte
+    /// wisselt maakt het blok onrustig en de rekensom onbetrouwbaar.
+    width: usize,
     order: Vec<String>,
     layers: HashMap<String, Layer>,
     drawn: usize,
@@ -382,6 +416,7 @@ impl PullRender {
         Self {
             tty,
             color,
+            width: bar_width(),
             order: Vec::new(),
             layers: HashMap::new(),
             drawn: 0,
@@ -440,7 +475,7 @@ impl PullRender {
         for id in &self.order[..shown] {
             out.push_str("\r\x1b[2K");
             if let Some(layer) = self.layers.get(id) {
-                out.push_str(&layer.render(id, self.color));
+                out.push_str(&layer.render(id, self.color, self.width));
             }
             out.push('\n');
         }
@@ -504,8 +539,10 @@ mod tests {
         }
     }
 
+    /// Vaste breedte, zodat de verwachtingen niet afhangen van het venster
+    /// waarin de tests toevallig draaien.
     fn line(render: &PullRender, id: &str) -> String {
-        render.layers[id].render(id, false)
+        render.layers[id].render(id, false, 20)
     }
 
     #[test]
@@ -654,9 +691,33 @@ mod tests {
     fn colour_wraps_only_the_bar() {
         let mut render = PullRender::new(false, true);
         render.update(&plain("a1b2", "Already exists"));
-        let rendered = render.layers["a1b2"].render("a1b2", true);
+        let rendered = render.layers["a1b2"].render("a1b2", true, 20);
         assert!(rendered.contains("\x1b[32m████"));
         assert!(rendered.ends_with("\x1b[0m  100%  exists"));
+    }
+
+    #[test]
+    fn the_bar_grows_with_the_terminal_but_stays_within_bounds() {
+        assert_eq!(
+            bar_width_for(40),
+            BAR_MIN,
+            "een smal venster houdt de ondergrens"
+        );
+        assert_eq!(bar_width_for(80), 28);
+        assert_eq!(
+            bar_width_for(140),
+            BAR_MAX,
+            "breder dan dit vertelt niets extra"
+        );
+    }
+
+    #[test]
+    fn a_bar_is_exactly_as_wide_as_asked() {
+        for width in [BAR_MIN, 33, BAR_MAX] {
+            for filled in [0.0, 0.5, 1.0] {
+                assert_eq!(bar(filled, width).chars().count(), width);
+            }
+        }
     }
 
     #[test]

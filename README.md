@@ -84,6 +84,12 @@ CLI zelf getekend. Checkcheck tekent zijn eigen balk uit die getallen en
 herschrijft de regel van die laag ter plekke. De snelheid is een lopend
 gemiddelde, zodat één trage seconde het getal niet laat schieten.
 
+De balk schaalt mee met je terminal: minimaal twintig tekens, maximaal zestig.
+Dat maximum is geen smaakkwestie — een regel die breder is dan het venster
+breekt af op een tweede regel, en dan klopt de cursor-rekensom van het blok niet
+meer en loopt het beeld door zichzelf heen. De breedte wordt één keer bij de
+start bepaald, zodat het blok niet gaat schuiven als je het venster versleept.
+
 De kleur zegt wat er gebeurt: gedimd betekent dat de laag nog wacht, cyaan dat
 er bytes bewegen, groen dat ze binnen zijn. Met `--no-color` of de
 omgevingsvariabele `NO_COLOR` blijft het bij blokken zonder kleur.
